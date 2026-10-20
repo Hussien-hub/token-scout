@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Token Scout</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: one working column; status header, summary strip, filter bar, ranked table with expandable rows */
+:root {
+  --bg: #eef1f3;
+  --panel: #ffffff;
+  --sunk: #e4e8ec;
+  --line: #d3d9df;
+  --fg: #131a22;
+  --muted: #5b6672;
+  --accent: #2b45c9;
+  --accent-soft: #e2e7fb;
+  --good: #137a4b;
+  --good-soft: #dcf2e6;
+  --mid: #9a6400;
+  --mid-soft: #fbedd2;
+  --bad: #b3261e;
+  --bad-soft: #f9e0de;
+  --font-ui: "Schibsted Grotesk", "Segoe UI", system-ui, sans-serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1318; --panel: #151c23; --sunk: #1b232c; --line: #27313c;
+    --fg: #dfe5ea; --muted: #8b97a3; --accent: #8fa2ff; --accent-soft: #1f2748;
+    --good: #4fcf8e; --good-soft: #12301f; --mid: #f0b54a; --mid-soft: #33270f;
+    --bad: #ff8a80; --bad-soft: #3a1714; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1318; --panel: #151c23; --sunk: #1b232c; --line: #27313c;
+  --fg: #dfe5ea; --muted: #8b97a3; --accent: #8fa2ff; --accent-soft: #1f2748;
+  --good: #4fcf8e; --good-soft: #12301f; --mid: #f0b54a; --mid-soft: #33270f;
+  --bad: #ff8a80; --bad-soft: #3a1714; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 14px/1.45 var(--font-ui);
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 20px 48px;
+}
+.wrap { max-width: 1320px; margin: 0 auto; display: grid; gap: 18px; }
+a { color: var(--accent); }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header.top { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px; }
+.brand { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.brand h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.02em; }
+.brand h1 span { color: var(--accent); }
+.status { font-family: var(--font-data); font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+.status b { color: var(--fg); font-weight: 500; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; vertical-align: 1px; }
+.dot.stale { background: var(--mid); }
+.demo { background: var(--mid-soft); color: var(--mid); border: 1px solid color-mix(in srgb, var(--mid) 35%, transparent); padding: 10px 14px; border-radius: 8px; font-size: 13px; }
+
+.strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.strip div { background: var(--panel); padding: 12px 16px; }
+.strip .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.strip .v { font-family: var(--font-data); font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.strip .v small { font-size: 12px; color: var(--muted); font-weight: 400; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+.search { flex: 1 1 220px; min-width: 0; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+.chip[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.ctl { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.ctl input[type=range] { accent-color: var(--accent); width: 120px; }
+.ctl output { font-family: var(--font-data); color: var(--fg); min-width: 2ch; }
+.ctl select { padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); }
+.ctl input[type=checkbox] { accent-color: var(--accent); }
+
+.tablebox { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; min-width: 1040px; }
+th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); font-weight: 600; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--sunk); }
+th.num, td.num { text-align: right; }
+th button { all: unset; cursor: pointer; }
+th button:hover { color: var(--fg); }
+th button[data-active="true"] { color: var(--accent); }
+td { padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+td.num { font-family: var(--font-data); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
+tr.row { cursor: pointer; }
+tr.row:hover td { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+tr.row[aria-expanded="true"] td { background: var(--accent-soft); border-bottom-color: transparent; }
+
+.score { display: inline-grid; place-items: center; width: 44px; height: 30px; border-radius: 6px; font-family: var(--font-data); font-weight: 600; font-size: 15px; }
+.s-hi { background: var(--good-soft); color: var(--good); }
+.s-md { background: var(--mid-soft); color: var(--mid); }
+.s-lo { background: var(--bad-soft); color: var(--bad); }
+.delta { display: block; font-family: var(--font-data); font-size: 10px; color: var(--muted); text-align: center; margin-top: 2px; }
+
+.tok { display: flex; gap: 10px; align-items: center; min-width: 0; }
+.avatar { width: 30px; height: 30px; border-radius: 50%; flex: none; display: grid; place-items: center; font-weight: 700; font-size: 12px; background: var(--sunk); color: var(--muted); overflow: hidden; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; }
+.tok .sym { font-weight: 700; }
+.tok .nm { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+.net { font-family: var(--font-data); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; color: var(--muted); margin-left: 6px; vertical-align: 1px; }
+
+.up { color: var(--good); } .down { color: var(--bad); }
+.bsbar { display: flex; height: 5px; width: 78px; border-radius: 3px; overflow: hidden; background: var(--bad); margin-top: 4px; margin-left: auto; }
+.bsbar i { background: var(--good); display: block; }
+.sig { display: flex; gap: 4px; }
+.sig span { font-family: var(--font-data); font-size: 10px; padding: 2px 5px; border-radius: 4px; background: var(--sunk); color: var(--muted); }
+.sig span.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.flags { display: flex; gap: 4px; flex-wrap: wrap; max-width: 260px; }
+.flag { font-size: 11px; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
+.f-danger { background: var(--bad-soft); color: var(--bad); }
+.f-warn { background: var(--mid-soft); color: var(--mid); }
+.f-good { background: var(--good-soft); color: var(--good); }
+.f-info { background: var(--sunk); color: var(--muted); }
+
+tr.detail td { background: var(--accent-soft); padding: 4px 16px 18px; }
+.dgrid { display: grid; grid-template-columns: minmax(240px, 1.1fr) minmax(220px, 1fr) minmax(200px, 0.9fr); gap: 24px; }
+.dgrid > div { min-width: 0; }
+.dgrid h4 { margin: 8px 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.part { display: grid; grid-template-columns: 78px 1fr 56px; align-items: center; gap: 10px; margin-bottom: 7px; font-size: 13px; }
+.part .track { height: 8px; background: var(--panel); border-radius: 4px; overflow: hidden; }
+.part .fill { height: 100%; background: var(--accent); border-radius: 4px; }
+.part .pv { font-family: var(--font-data); font-size: 12px; text-align: right; color: var(--muted); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--font-data); font-size: 12px; word-break: break-all; }
+.links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.links a { font-size: 12px; text-decoration: none; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); }
+.links a:hover { border-color: var(--accent); }
+.copy { cursor: pointer; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 5px 10px; font-size: 12px; }
+svg.spark { width: 100%; height: 54px; display: block; }
+
+.empty { padding: 40px 20px; text-align: center; color: var(--muted); }
+footer { font-size: 12px; color: var(--muted); max-width: 80ch; }
+footer code { font-family: var(--font-data); font-size: 11px; }
+
+@media (max-width: 760px) {
+  .dgrid { grid-template-columns: 1fr; }
+  .brand h1 { font-size: 24px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .fill { transition: width .4s ease; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <h1>Token<span>Scout</span></h1>
+      <div class="status" id="status"></div>
+    </div>
+    <div class="status" id="filtersum"></div>
+  </header>
+
+  <div class="demo" id="demo" hidden>Example data. Run <code>python3 scanner.py</code> on your server to fill this page with live tokens.</div>
+
+  <section class="strip" id="strip" aria-label="Summary"></section>
+
+  <section class="controls" aria-label="Filters">
+    <input class="search" id="q" type="search" placeholder="Search symbol, name or address" aria-label="Search">
+    <div class="chips" id="chains" role="group" aria-label="Chains"></div>
+    <label class="ctl" for="minScore">Min score <input id="minScore" type="range" min="0" max="90" step="5" value="0"><output id="minScoreOut">0</output></label>
+    <label class="ctl"><input id="hideDanger" type="checkbox"> Hide red flags</label>
+    <label class="ctl"><input id="needSocial" type="checkbox"> Has website or socials</label>
+  </section>
+
+  <div class="tablebox">
+    <table>
+      <thead>
+        <tr>
+          <th><button data-sort="score">Score</button></th>
+          <th>Token</th>
+          <th class="num"><button data-sort="age_min">Age</button></th>
+          <th class="num"><button data-sort="liquidity">Liquidity</button></th>
+          <th class="num"><button data-sort="fdv">FDV</button></th>
+          <th class="num"><button data-sort="vol_h1">Vol 1h</button></th>
+          <th class="num"><button data-sort="txns">Txns 1h</button></th>
+          <th class="num"><button data-sort="chg_h1">1h</button></th>
+          <th>Signals</th>
+          <th>Flags</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>No tokens match these filters.</div>
+  </div>
+
+  <footer>
+    Score = safety 35 + liquidity 15 + activity 20 + momentum 10 + project signals 20. Honeypots and high sell taxes are removed before scoring.
+    A high score means the token passed the automated checks, not that the project is good. Read the contract, the team and the docs before buying.
+  </footer>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null || { meta: { demo: true, networks: [] }, tokens: [] };
+const REFRESH_S = parseInt("__REFRESH__", 10) || 300;
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("ts:" + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("ts:" + k, JSON.stringify(v)); } catch (e) {} }
+};
+
+const state = {
+  q: "",
+  chains: store.get("chains", []),
+  minScore: store.get("minScore", 0),
+  hideDanger: store.get("hideDanger", false),
+  needSocial: store.get("needSocial", false),
+  sort: store.get("sort", "score"),
+  dir: store.get("dir", -1),
+  open: new Set(),
+};
+
+const usd = (x) => {
+  if (!x) return "–";
+  if (x >= 1e9) return "$" + (x / 1e9).toFixed(2) + "B";
+  if (x >= 1e6) return "$" + (x / 1e6).toFixed(2) + "M";
+  if (x >= 1e3) return "$" + (x / 1e3).toFixed(1) + "k";
+  return "$" + x.toFixed(0);
+};
+const age = (m) => {
+  if (m == null) return "–";
+  const live = m + (Date.now() - new Date(DATA.meta.scanned_at || Date.now())) / 60000;
+  if (live < 60) return Math.round(live) + "m";
+  if (live < 1440) return (live / 60).toFixed(1) + "h";
+  return (live / 1440).toFixed(1) + "d";
+};
+const pct = (x) => (x > 0 ? "+" : "") + (x || 0).toFixed(0) + "%";
+const ago = (iso) => {
+  const s = (Date.now() - new Date(iso)) / 1000;
+  if (s < 90) return Math.round(s) + "s ago";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  return (s / 3600).toFixed(1) + " h ago";
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const safeUrl = (u) => (typeof u === "string" && /^https?:\/\//i.test(u) ? u : "#");
+const band = (s) => (s >= 70 ? "s-hi" : s >= 50 ? "s-md" : "s-lo");
+
+const PARTS = [["safety", "Safety", 35], ["liquidity", "Liquidity", 15], ["activity", "Activity", 20], ["momentum", "Momentum", 10], ["project", "Project", 20]];
+
+function socialSet(t) {
+  const s = new Set((t.socials || []).map((x) => (x.type === "x" ? "twitter" : x.type)));
+  if ((t.websites || []).length) s.add("web");
+  return s;
+}
+
+function renderHeader() {
+  const m = DATA.meta;
+  const stale = m.scanned_at && (Date.now() - new Date(m.scanned_at)) / 60000 > (m.interval_min || 5) * 3;
+  $("status").innerHTML = m.scanned_at
+    ? `<span><i class="dot ${stale ? "stale" : ""}"></i>Last scan <b>${ago(m.scanned_at)}</b></span><span>every <b>${m.interval_min} min</b></span><span>${(m.networks || []).map(esc).join(" · ")}</span>`
+    : "<span>No scan yet</span>";
+  const f = m.filters || {};
+  $("filtersum").textContent = f.min_liquidity_usd != null
+    ? `Filters: liq ≥ ${usd(f.min_liquidity_usd)} · age ${f.min_age_minutes}m–${f.max_age_hours}h · vol 1h ≥ ${usd(f.min_volume_h1_usd)} · ≥ ${f.min_txns_h1} txns`
+    : "";
+  $("demo").hidden = !m.demo;
+
+  const toks = DATA.tokens;
+  const hi = toks.filter((t) => t.score >= 70).length;
+  const avg = toks.length ? Math.round(toks.reduce((a, t) => a + t.score, 0) / toks.length) : 0;
+  const clean = toks.filter((t) => !(t.flags || []).some((f) => f[0] === "danger")).length;
+  $("strip").innerHTML = [
+    ["Tracked", toks.length, `<small> tokens</small>`],
+    ["Score 70+", hi, ""],
+    ["No red flags", clean, `<small> of ${toks.length}</small>`],
+    ["Average score", avg, ""],
+    ["Last scan", m.passed ?? 0, `<small> of ${m.pools_found ?? 0} pools passed</small>`],
+  ].map(([k, v, s]) => `<div><div class="k">${k}</div><div class="v">${v}${s}</div></div>`).join("");
+}
+
+function renderChips() {
+  const nets = [...new Set(DATA.tokens.map((t) => t.network).concat(DATA.meta.networks || []))];
+  $("chains").innerHTML = nets.map((n) => `<button class="chip" data-net="${esc(n)}" aria-pressed="${state.chains.includes(n)}">${esc(n)}</button>`).join("");
+}
+
+function filtered() {
+  const q = state.q.trim().toLowerCase();
+  let list = DATA.tokens.filter((t) => {
+    if (state.chains.length && !state.chains.includes(t.network)) return false;
+    if (t.score < state.minScore) return false;
+    if (state.hideDanger && (t.flags || []).some((f) => f[0] === "danger")) return false;
+    if (state.needSocial && socialSet(t).size === 0) return false;
+    if (q && !(`${t.symbol} ${t.name} ${t.token}`.toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const key = state.sort;
+  const val = (t) => (key === "txns" ? t.buys_h1 + t.sells_h1 : key === "fdv" ? t.fdv || t.mcap : t[key] ?? 0);
+  list.sort((a, b) => (val(a) - val(b)) * state.dir);
+  return list;
+}
+
+function spark(hist) {
+  if (!hist || hist.length < 2) return '<p style="color:var(--muted);font-size:12px;margin:0">Trend appears after a few scans.</p>';
+  const w = 240, h = 54, pad = 4;
+  const x = (i) => pad + (i / (hist.length - 1)) * (w - pad * 2);
+  const y = (v) => h - pad - (v / 100) * (h - pad * 2);
+  const pts = hist.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const last = hist[hist.length - 1];
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Score trend">
+    <line x1="${pad}" x2="${w - pad}" y1="${y(70)}" y2="${y(70)}" stroke="var(--line)" stroke-dasharray="3 3"/>
+    <polygon points="${x(0)},${h - pad} ${pts} ${x(hist.length - 1)},${h - pad}" fill="var(--accent)" fill-opacity="0.12"/>
+    <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+    <circle cx="${x(hist.length - 1)}" cy="${y(last)}" r="3.5" fill="var(--accent)"/>
+  </svg>`;
+}
+
+function detailRow(t) {
+  const parts = PARTS.map(([k, label, max]) => {
+    const v = (t.parts || {})[k] || 0;
+    return `<div class="part"><span>${label}</span><div class="track"><div class="fill" style="width:${(v / max) * 100}%"></div></div><span class="pv">${v.toFixed(0)}/${max}</span></div>`;
+  }).join("");
+  const flags = (t.flags || []).map((f) => `<span class="flag f-${esc(f[0])}">${esc(f[1])}</span>`).join("") || '<span class="flag f-good">No flags</span>';
+  const soc = [...(t.websites || []).map((u) => ["Website", u]), ...(t.socials || []).map((s) => [s.type, s.url])];
+  const links = [["DexScreener", t.ds_url], ["GeckoTerminal", t.gt_url], ["Explorer", t.explorer], ["RugCheck", t.rugcheck_url], ...soc]
+    .filter(([, u]) => u).map(([l, u]) => `<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(l)}</a>`).join("");
+  return `<tr class="detail"><td colspan="10"><div class="dgrid">
+    <div><h4>Score breakdown</h4>${parts}<h4>Flags</h4><div class="flags" style="max-width:none">${flags}</div></div>
+    <div><h4>Details</h4><dl class="kv">
+      <dt>Contract</dt><dd>${esc(t.token)}</dd>
+      <dt>DEX</dt><dd>${esc(t.dex)}</dd>
+      <dt>Price</dt><dd>$${(t.price_usd || 0).toPrecision(4)}</dd>
+      <dt>Buyers / sellers 1h</dt><dd>${t.buyers_h1} / ${t.sellers_h1}</dd>
+      <dt>Vol 24h</dt><dd>${usd(t.vol_h24)}</dd>
+      <dt>Change 5m / 24h</dt><dd>${pct(t.chg_m5)} / ${pct(t.chg_h24)}</dd>
+      ${t.holders ? `<dt>Holders</dt><dd>${t.holders.toLocaleString()}</dd>` : ""}
+      <dt>Security</dt><dd>${t.checked ? "checked" : "not checked"}</dd>
+      <dt>First seen</dt><dd>${ago(t.first_seen)} at score ${t.first_score}</dd>
+    </dl>
+    <div class="links">${links}<button class="copy" data-copy="${esc(t.token)}">Copy address</button></div></div>
+    <div><h4>Score trend</h4>${spark(t.history)}</div>
+  </div></td></tr>`;
+}
+
+function renderRows() {
+  const list = filtered();
+  $("empty").hidden = list.length > 0;
+  document.querySelectorAll("th button").forEach((b) => (b.dataset.active = b.dataset.sort === state.sort));
+  $("rows").innerHTML = list.map((t) => {
+    const key = t.network + ":" + t.token;
+    const open = state.open.has(key);
+    const s = socialSet(t);
+    const sig = [["web", "WEB"], ["twitter", "X"], ["telegram", "TG"], ["discord", "DC"]].map(([k, l]) => `<span class="${s.has(k) ? "on" : ""}">${l}</span>`).join("");
+    const bad = (t.flags || []).filter((f) => f[0] !== "good").sort((a, b) => (a[0] === "danger" ? -1 : 1));
+    const shown = bad.slice(0, 2).map((f) => `<span class="flag f-${esc(f[0])}">${esc(f[1])}</span>`).join("") + (bad.length > 2 ? `<span class="flag f-info">+${bad.length - 2}</span>` : "");
+    const tx = t.buys_h1 + t.sells_h1;
+    const buyShare = tx ? (t.buys_h1 / tx) * 100 : 50;
+    const d = t.score - (t.first_score ?? t.score);
+    const initials = esc((t.symbol || "?").slice(0, 2).toUpperCase());
+    const img = t.image ? `<img src="${esc(safeUrl(t.image))}" alt="" loading="lazy" onerror="this.remove()">` : initials;
+    return `<tr class="row" data-key="${esc(key)}" aria-expanded="${open}" tabindex="0">
+      <td><span class="score ${band(t.score)}">${t.score}</span>${d ? `<span class="delta">${d > 0 ? "▲" : "▼"} ${Math.abs(d)}</span>` : ""}</td>
+      <td><div class="tok"><div class="avatar">${img}</div><div style="min-width:0"><div><span class="sym">${esc(t.symbol)}</span><span class="net">${esc(t.network)}</span></div><div class="nm">${esc(t.name)}</div></div></div></td>
+      <td class="num">${age(t.age_min)}</td>
+      <td class="num">${usd(t.liquidity)}</td>
+      <td class="num">${usd(t.fdv || t.mcap)}</td>
+      <td class="num">${usd(t.vol_h1)}</td>
+      <td class="num">${tx}<div class="bsbar" title="${t.buys_h1} buys / ${t.sells_h1} sells"><i style="width:${buyShare}%"></i></div></td>
+      <td class="num ${t.chg_h1 >= 0 ? "up" : "down"}">${pct(t.chg_h1)}</td>
+      <td><div class="sig">${sig}</div></td>
+      <td><div class="flags">${shown || '<span class="flag f-good">Clean</span>'}</div></td>
+    </tr>${open ? detailRow(t) : ""}`;
+  }).join("");
+}
+
+function persist() {
+  ["chains", "minScore", "hideDanger", "needSocial", "sort", "dir"].forEach((k) => store.set(k, state[k]));
+}
+
+function bind() {
+  $("minScore").value = state.minScore; $("minScoreOut").value = state.minScore;
+  $("hideDanger").checked = state.hideDanger; $("needSocial").checked = state.needSocial;
+  $("q").addEventListener("input", (e) => { state.q = e.target.value; renderRows(); });
+  $("minScore").addEventListener("input", (e) => { state.minScore = +e.target.value; $("minScoreOut").value = e.target.value; persist(); renderRows(); });
+  $("hideDanger").addEventListener("change", (e) => { state.hideDanger = e.target.checked; persist(); renderRows(); });
+  $("needSocial").addEventListener("change", (e) => { state.needSocial = e.target.checked; persist(); renderRows(); });
+  $("chains").addEventListener("click", (e) => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    const n = b.dataset.net;
+    state.chains = state.chains.includes(n) ? state.chains.filter((x) => x !== n) : [...state.chains, n];
+    b.setAttribute("aria-pressed", state.chains.includes(n)); persist(); renderRows();
+  });
+  document.querySelector("thead").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-sort]"); if (!b) return;
+    if (state.sort === b.dataset.sort) state.dir *= -1; else { state.sort = b.dataset.sort; state.dir = b.dataset.sort === "age_min" ? 1 : -1; }
+    persist(); renderRows();
+  });
+  const toggle = (row) => { const k = row.dataset.key; state.open.has(k) ? state.open.delete(k) : state.open.add(k); renderRows(); };
+  $("rows").addEventListener("click", (e) => {
+    const c = e.target.closest("[data-copy]");
+    if (c) {
+      e.stopPropagation();
+      const done = () => { c.textContent = "Copied"; setTimeout(() => (c.textContent = "Copy address"), 1500); };
+      if (navigator.clipboard) navigator.clipboard.writeText(c.dataset.copy).then(done).catch(() => {});
+      return;
+    }
+    if (e.target.closest("a")) return;
+    const row = e.target.closest("tr.row"); if (row) toggle(row);
+  });
+  $("rows").addEventListener("keydown", (e) => {
+    const row = e.target.closest("tr.row");
+    if (row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggle(row); }
+  });
+}
+
+renderHeader(); renderChips(); bind(); renderRows();
+setInterval(renderHeader, 30000);
+// reload after each scan cycle; filters are kept in this browser
+if (!DATA.meta.demo) setTimeout(() => location.reload(), REFRESH_S * 1000 + 15000);
+</script>
+</body>
+</html>

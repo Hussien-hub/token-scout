@@ -1,0 +1,28 @@
+{
+  "networks": ["solana", "base", "bsc", "eth"],
+  "pages_per_network": 2,
+  "scan_interval_minutes": 5,
+  "keep_tokens_hours": 48,
+
+  "filters": {
+    "min_age_minutes": 20,
+    "max_age_hours": 72,
+    "min_liquidity_usd": 15000,
+    "max_liquidity_usd": 5000000,
+    "min_fdv_usd": 30000,
+    "max_fdv_usd": 50000000,
+    "min_volume_h1_usd": 2000,
+    "min_txns_h1": 25,
+    "max_sell_tax": 0.10,
+    "drop_honeypots": true
+  },
+
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "min_score": 70
+  },
+
+  "output_dir": "output"
+}

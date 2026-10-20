@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+Token Scout - finds freshly launched DEX tokens, filters them, runs security
+checks and scores each one 0-100. Writes a dashboard (output/index.html) every
+cycle and can send Telegram alerts for high scorers.
+
+Data sources (all free, no API key):
+  GeckoTerminal  new pools per chain
+  DexScreener    website / socials / boosts for each token
+  GoPlus         contract security for EVM chains
+  RugCheck       contract security for Solana
+
+Usage:
+  python3 scanner.py            # run forever, one scan every N minutes
+  python3 scanner.py --once     # single scan, then exit
+  python3 scanner.py --demo     # build the dashboard from example data (no network)
+
+Only the Python standard library is used.
+"""
+
+import argparse
+import json
+import math
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# GeckoTerminal network id -> (DexScreener chain id, GoPlus chain id or "solana", explorer token URL)
+CHAINS = {
+    "solana":      ("solana",   "solana", "https://solscan.io/token/{}"),
+    "eth":         ("ethereum", "1",      "https://etherscan.io/token/{}"),
+    "bsc":         ("bsc",      "56",     "https://bscscan.com/token/{}"),
+    "base":        ("base",     "8453",   "https://basescan.org/token/{}"),
+    "arbitrum":    ("arbitrum", "42161",  "https://arbiscan.io/token/{}"),
+    "polygon_pos": ("polygon",  "137",    "https://polygonscan.com/token/{}"),
+}
+
+UA = {"User-Agent": "token-scout/1.0", "Accept": "application/json"}
+
+
+# ---------------------------------------------------------------- http helpers
+
+class RateLimiter:
+    """Keeps a minimum gap between calls to the same host."""
+
+    def __init__(self, gaps):
+        self.gaps = gaps
+        self.last = {}
+
+    def wait(self, host):
+        gap = self.gaps.get(host, 0.3)
+        delta = time.time() - self.last.get(host, 0)
+        if delta < gap:
+            time.sleep(gap - delta)
+        self.last[host] = time.time()
+
+
+LIMITER = RateLimiter({
+    "api.geckoterminal.com": 2.2,   # free tier ~30 req/min
+    "api.dexscreener.com": 0.4,
+    "api.gopluslabs.io": 1.2,
+    "api.rugcheck.xyz": 1.0,
+})
+
+
+def get_json(url, retries=3):
+    host = urllib.parse.urlparse(url).netloc
+    for attempt in range(retries):
+        LIMITER.wait(host)
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(15 * (attempt + 1))
+                continue
+            if e.code in (500, 502, 503, 504):
+                time.sleep(3 * (attempt + 1))
+                continue
+            log(f"HTTP {e.code} for {url}")
+            return None
+        except Exception as e:  # network errors, bad json
+            log(f"request failed ({e.__class__.__name__}) for {url}")
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def fnum(x, default=0.0):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except (TypeError, ValueError):
+        return default
+
+
+# ---------------------------------------------------------------- 1. discovery
+
+def fetch_new_pools(network, pages):
+    pools = []
+    for page in range(1, pages + 1):
+        url = (f"https://api.geckoterminal.com/api/v2/networks/{network}/new_pools"
+               f"?page={page}&include=base_token,dex")
+        data = get_json(url)
+        if not data:
+            break
+        tokens = {}
+        for inc in data.get("included", []) or []:
+            if inc.get("type") == "token":
+                tokens[inc["id"]] = inc.get("attributes", {})
+        for p in data.get("data", []) or []:
+            a = p.get("attributes", {})
+            rel = p.get("relationships", {})
+            tok_id = (rel.get("base_token", {}).get("data") or {}).get("id", "")
+            dex_id = (rel.get("dex", {}).get("data") or {}).get("id", "")
+            tok = tokens.get(tok_id, {})
+            tx_h1 = (a.get("transactions") or {}).get("h1") or {}
+            tx_m5 = (a.get("transactions") or {}).get("m5") or {}
+            vol = a.get("volume_usd") or {}
+            pc = a.get("price_change_percentage") or {}
+            token_addr = tok.get("address") or tok_id.split("_", 1)[-1]
+            pools.append({
+                "network": network,
+                "pool": a.get("address"),
+                "pair_name": a.get("name", ""),
+                "token": token_addr,
+                "name": tok.get("name") or a.get("name", "").split(" / ")[0],
+                "symbol": tok.get("symbol") or a.get("name", "").split(" / ")[0],
+                "dex": dex_id,
+                "created": a.get("pool_created_at"),
+                "price_usd": fnum(a.get("base_token_price_usd")),
+                "liquidity": fnum(a.get("reserve_in_usd")),
+                "fdv": fnum(a.get("fdv_usd")),
+                "mcap": fnum(a.get("market_cap_usd")),
+                "vol_m5": fnum(vol.get("m5")),
+                "vol_h1": fnum(vol.get("h1")),
+                "vol_h24": fnum(vol.get("h24")),
+                "chg_m5": fnum(pc.get("m5")),
+                "chg_h1": fnum(pc.get("h1")),
+                "chg_h24": fnum(pc.get("h24")),
+                "buys_h1": int(fnum(tx_h1.get("buys"))),
+                "sells_h1": int(fnum(tx_h1.get("sells"))),
+                "buyers_h1": int(fnum(tx_h1.get("buyers"))),
+                "sellers_h1": int(fnum(tx_h1.get("sellers"))),
+                "buys_m5": int(fnum(tx_m5.get("buys"))),
+                "sells_m5": int(fnum(tx_m5.get("sells"))),
+            })
+    return pools
+
+
+def age_minutes(created_iso):
+    if not created_iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(created_iso.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- 2. hard filters
+
+def passes_filters(p, f):
+    age = age_minutes(p["created"])
+    p["age_min"] = age
+    reasons = []
+    if age is None:
+        reasons.append("unknown age")
+    else:
+        if age < f["min_age_minutes"]:
+            reasons.append("too new")
+        if age > f["max_age_hours"] * 60:
+            reasons.append("too old")
+    if p["liquidity"] < f["min_liquidity_usd"]:
+        reasons.append("low liquidity")
+    if p["liquidity"] > f["max_liquidity_usd"]:
+        reasons.append("liquidity above range")
+    fdv = p["fdv"] or p["mcap"]
+    if fdv and fdv < f["min_fdv_usd"]:
+        reasons.append("fdv too small")
+    if fdv and fdv > f["max_fdv_usd"]:
+        reasons.append("fdv too large")
+    if p["vol_h1"] < f["min_volume_h1_usd"]:
+        reasons.append("low volume")
+    if p["buys_h1"] + p["sells_h1"] < f["min_txns_h1"]:
+        reasons.append("few txns")
+    return not reasons, reasons
+
+
+# ---------------------------------------------------------------- 3. enrichment
+
+def enrich_dexscreener(pools):
+    """Adds websites/socials/boosts from DexScreener, 30 tokens per call."""
+    addrs = list({p["token"] for p in pools if p["token"]})
+    info = {}
+    for i in range(0, len(addrs), 30):
+        chunk = addrs[i:i + 30]
+        data = get_json("https://api.dexscreener.com/latest/dex/tokens/" + ",".join(chunk))
+        for pair in (data or {}).get("pairs") or []:
+            addr = (pair.get("baseToken") or {}).get("address", "")
+            key = addr.lower()
+            liq = fnum((pair.get("liquidity") or {}).get("usd"))
+            prev = info.get(key)
+            if prev and prev["_liq"] >= liq and prev["socials"]:
+                prev["pairs"] += 1
+                continue
+            i_ = pair.get("info") or {}
+            info[key] = {
+                "_liq": liq,
+                "pairs": (prev["pairs"] + 1) if prev else 1,
+                "websites": [w.get("url") for w in i_.get("websites") or [] if w.get("url")],
+                "socials": [{"type": (s.get("type") or s.get("platform") or "").lower(),
+                             "url": s.get("url")} for s in i_.get("socials") or [] if s.get("url")],
+                "image": i_.get("imageUrl"),
+                "boosts": int(fnum((pair.get("boosts") or {}).get("active"))),
+                "has_profile": bool(i_),
+                "ds_url": pair.get("url"),
+            }
+    for p in pools:
+        d = info.get(p["token"].lower(), {})
+        p["websites"] = d.get("websites", [])
+        p["socials"] = d.get("socials", [])
+        p["image"] = d.get("image")
+        p["boosts"] = d.get("boosts", 0)
+        p["has_profile"] = d.get("has_profile", False)
+        p["pair_count"] = d.get("pairs", 1)
+        p["ds_url"] = d.get("ds_url") or (
+            f"https://dexscreener.com/{CHAINS.get(p['network'], (p['network'],))[0]}/{p['pool']}")
+
+
+def security_evm(pools, chain_id):
+    out = {}
+    addrs = list({p["token"].lower() for p in pools})
+    for i in range(0, len(addrs), 20):
+        chunk = addrs[i:i + 20]
+        data = get_json(f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
+                        f"?contract_addresses={','.join(chunk)}")
+        for addr, r in ((data or {}).get("result") or {}).items():
+            flags, penalty, fatal = [], 0, False
+
+            def yes(k):
+                return str(r.get(k, "0")) == "1"
+
+            if yes("is_honeypot"):
+                fatal = True; flags.append(("danger", "Honeypot"))
+            if yes("cannot_sell_all"):
+                penalty += 15; flags.append(("danger", "Cannot sell all"))
+            if yes("owner_change_balance"):
+                penalty += 15; flags.append(("danger", "Owner can change balances"))
+            if str(r.get("is_open_source", "1")) == "0":
+                penalty += 15; flags.append(("danger", "Source not verified"))
+            if yes("hidden_owner"):
+                penalty += 8; flags.append(("warn", "Hidden owner"))
+            if yes("is_mintable"):
+                penalty += 8; flags.append(("warn", "Mintable"))
+            if yes("transfer_pausable"):
+                penalty += 6; flags.append(("warn", "Transfers pausable"))
+            if yes("is_proxy"):
+                penalty += 5; flags.append(("warn", "Upgradeable proxy"))
+            if yes("is_blacklisted"):
+                penalty += 5; flags.append(("warn", "Has blacklist"))
+            buy_tax, sell_tax = fnum(r.get("buy_tax")), fnum(r.get("sell_tax"))
+            if sell_tax > 0.05 or buy_tax > 0.05:
+                penalty += 6; flags.append(("warn", f"Tax {buy_tax:.0%}/{sell_tax:.0%}"))
+            top10 = sum(fnum(h.get("percent")) for h in (r.get("holders") or [])[:10]
+                        if str(h.get("is_contract", "0")) != "1" and not h.get("is_locked"))
+            if top10 > 0.5:
+                penalty += 10; flags.append(("danger", f"Top holders own {top10:.0%}"))
+            elif top10 > 0.3:
+                penalty += 4; flags.append(("warn", f"Top holders own {top10:.0%}"))
+            lp_locked = sum(fnum(h.get("percent")) for h in (r.get("lp_holders") or [])
+                            if h.get("is_locked") in (1, "1") or
+                            str(h.get("address", "")).lower().startswith("0x000000000000000000000000000000000000dead"))
+            if r.get("lp_holders") is not None:
+                if lp_locked >= 0.9:
+                    flags.append(("good", f"LP locked/burned {lp_locked:.0%}"))
+                elif lp_locked < 0.5:
+                    penalty += 8; flags.append(("warn", f"LP locked only {lp_locked:.0%}"))
+            out[addr.lower()] = {
+                "checked": True, "fatal": fatal, "penalty": penalty, "flags": flags,
+                "sell_tax": sell_tax, "holders": int(fnum(r.get("holder_count"))),
+            }
+    return out
+
+
+def security_solana(pools):
+    out = {}
+    for p in pools:
+        mint = p["token"]
+        r = get_json(f"https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary")
+        if not r:
+            continue
+        flags, penalty, fatal = [], 0, False
+        for risk in r.get("risks") or []:
+            level = (risk.get("level") or "").lower()
+            name = risk.get("name") or "Risk"
+            if level == "danger":
+                penalty += 12; flags.append(("danger", name))
+            elif level == "warn":
+                penalty += 4; flags.append(("warn", name))
+        lp = r.get("lpLockedPct")
+        if lp is not None:
+            lp = fnum(lp)
+            if lp >= 90:
+                flags.append(("good", f"LP locked {lp:.0f}%"))
+        if any("freeze" in f[1].lower() for f in flags if f[0] == "danger"):
+            fatal = True   # freeze authority can stop you from selling
+        out[mint.lower()] = {"checked": True, "fatal": fatal, "penalty": penalty,
+                             "flags": flags, "sell_tax": 0.0, "holders": 0,
+                             "rugcheck_score": r.get("score_normalised", r.get("score"))}
+    return out
+
+
+def run_security(pools):
+    by_net = {}
+    for p in pools:
+        by_net.setdefault(p["network"], []).append(p)
+    results = {}
+    for net, group in by_net.items():
+        gp = CHAINS.get(net, (None, None))[1]
+        if gp == "solana":
+            results.update(security_solana(group))
+        elif gp:
+            results.update(security_evm(group, gp))
+    for p in pools:
+        p["security"] = results.get(p["token"].lower(),
+                                    {"checked": False, "fatal": False, "penalty": 0,
+                                     "flags": [("warn", "Security not checked")],
+                                     "sell_tax": 0.0, "holders": 0})
+
+
+# ---------------------------------------------------------------- 4. scoring
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def score_token(p):
+    """Returns total 0-100 and the five component scores."""
+    sec = p["security"]
+    flags = list(sec["flags"])
+
+    # Safety, max 35
+    safety = 35 - sec["penalty"] if sec["checked"] else 14
+    safety = clamp(safety, 0, 35)
+
+    # Liquidity, max 15: depth on a log scale ($10k -> 0, ~$500k -> 12) + ratio to FDV
+    liq = p["liquidity"]
+    depth = clamp((math.log10(max(liq, 1)) - 4) / (math.log10(500_000) - 4) * 12, 0, 12)
+    fdv = p["fdv"] or p["mcap"]
+    ratio = liq / fdv if fdv else 0
+    ratio_pts = 3 if 0.08 <= ratio <= 0.6 else (1.5 if 0.04 <= ratio < 0.08 else 0)
+    if fdv and ratio < 0.03:
+        flags.append(("warn", f"Thin liquidity vs FDV ({ratio:.1%})"))
+    liquidity = depth + ratio_pts
+
+    # Activity, max 20: unique buyers, txns, buy/sell balance
+    buyers = p["buyers_h1"] or p["buys_h1"]
+    txns = p["buys_h1"] + p["sells_h1"]
+    buyer_pts = clamp(math.log10(max(buyers, 1)) / math.log10(400) * 8, 0, 8)
+    txn_pts = clamp(math.log10(max(txns, 1)) / math.log10(1500) * 6, 0, 6)
+    bs = p["buys_h1"] / max(p["sells_h1"], 1)
+    if 1.0 <= bs <= 3.0:
+        bs_pts = 6
+    elif 0.7 <= bs < 1.0 or 3.0 < bs <= 5.0:
+        bs_pts = 3
+    else:
+        bs_pts = 0
+        flags.append(("warn", "Heavy selling" if bs < 0.7 else "Buys look botted"))
+    # many txns from few wallets = wash trading
+    if txns > 80 and buyers and txns / max(buyers + p["sellers_h1"], 1) > 6:
+        bs_pts = 0
+        flags.append(("warn", "Few wallets, many txns"))
+    activity = buyer_pts + txn_pts + bs_pts
+
+    # Momentum, max 10: volume turnover + healthy price move
+    turnover = p["vol_h1"] / max(liq, 1)
+    turn_pts = clamp(turnover / 0.5 * 5, 0, 5)
+    chg = p["chg_h1"]
+    if 0 <= chg <= 80:
+        chg_pts = 5
+    elif -15 <= chg < 0 or 80 < chg <= 200:
+        chg_pts = 2.5
+    else:
+        chg_pts = 0
+        if chg > 200:
+            flags.append(("warn", f"Already pumped {chg:.0f}% in 1h"))
+        else:
+            flags.append(("warn", f"Dumping {chg:.0f}% in 1h"))
+    momentum = turn_pts + chg_pts
+
+    # Project signals, max 20
+    stypes = {s["type"] for s in p.get("socials", [])}
+    project = 0
+    if p.get("websites"):
+        project += 7
+    if "twitter" in stypes or "x" in stypes:
+        project += 5
+    if "telegram" in stypes:
+        project += 4
+    if "discord" in stypes:
+        project += 2
+    if p.get("has_profile"):
+        project += 2
+    project = clamp(project, 0, 20)
+    if not p.get("websites") and not stypes:
+        flags.append(("warn", "No website or socials"))
+    if p.get("boosts"):
+        flags.append(("info", f"Paid DexScreener boosts ({p['boosts']})"))
+
+    total = safety + liquidity + activity + momentum + project
+    if sec["fatal"]:
+        total = min(total, 5)
+    p["flags"] = flags
+    p["parts"] = {
+        "safety": round(safety, 1), "liquidity": round(liquidity, 1),
+        "activity": round(activity, 1), "momentum": round(momentum, 1),
+        "project": round(project, 1),
+    }
+    p["score"] = int(round(clamp(total, 0, 100)))
+    return p["score"]
+
+
+# ---------------------------------------------------------------- 5. state, alerts, output
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"tokens": {}, "alerted": []}
+
+
+def save_state(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def telegram(cfg, text):
+    tg = cfg["telegram"]
+    url = f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage"
+    body = urllib.parse.urlencode({"chat_id": tg["chat_id"], "text": text,
+                                   "parse_mode": "HTML", "disable_web_page_preview": "true"}).encode()
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=15).read()
+    except Exception as e:
+        log(f"telegram failed: {e}")
+
+
+def fmt_usd(x):
+    if x >= 1e6:
+        return f"${x / 1e6:.2f}M"
+    if x >= 1e3:
+        return f"${x / 1e3:.1f}k"
+    return f"${x:.0f}"
+
+
+def alert_text(p):
+    bad = [f[1] for f in p["flags"] if f[0] in ("danger", "warn")][:3]
+    return (f"<b>{p['symbol']}</b> on {p['network']} · score <b>{p['score']}</b>\n"
+            f"Liq {fmt_usd(p['liquidity'])} · FDV {fmt_usd(p['fdv'] or p['mcap'])} · "
+            f"Vol 1h {fmt_usd(p['vol_h1'])} · {p['chg_h1']:+.0f}% 1h\n"
+            + (f"Flags: {', '.join(bad)}\n" if bad else "")
+            + f"{p['ds_url']}")
+
+
+def write_dashboard(cfg, state, meta):
+    out_dir = os.path.join(HERE, cfg["output_dir"])
+    os.makedirs(out_dir, exist_ok=True)
+    tokens = sorted(state["tokens"].values(), key=lambda t: -t["score"])
+    payload = {"meta": meta, "tokens": tokens}
+    with open(os.path.join(out_dir, "tokens.json"), "w") as f:
+        json.dump(payload, f, indent=1)
+    with open(os.path.join(HERE, "dashboard_template.html"), encoding="utf-8") as f:
+        tpl = f.read()
+    blob = json.dumps(payload).replace("</", "<\\/")
+    html = tpl.replace("/*__DATA__*/null", blob)
+    html = html.replace("__REFRESH__", str(max(60, int(cfg["scan_interval_minutes"] * 60))))
+    path = os.path.join(out_dir, "index.html")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(html)
+    os.replace(path + ".tmp", path)
+    return path
+
+
+def public_view(p):
+    keep = ["network", "pool", "token", "name", "symbol", "dex", "created", "age_min",
+            "price_usd", "liquidity", "fdv", "mcap", "vol_h1", "vol_h24", "chg_m5", "chg_h1",
+            "chg_h24", "buys_h1", "sells_h1", "buyers_h1", "sellers_h1", "websites",
+            "socials", "image", "boosts", "score", "parts", "flags", "ds_url"]
+    v = {k: p.get(k) for k in keep}
+    v["checked"] = p["security"]["checked"]
+    v["holders"] = p["security"].get("holders", 0)
+    v["explorer"] = CHAINS.get(p["network"], (None, None, "{}"))[2].format(p["token"])
+    v["gt_url"] = f"https://www.geckoterminal.com/{p['network']}/pools/{p['pool']}"
+    if p["network"] == "solana":
+        v["rugcheck_url"] = f"https://rugcheck.xyz/tokens/{p['token']}"
+    return v
+
+
+# ---------------------------------------------------------------- main loop
+
+def scan(cfg, state):
+    started = time.time()
+    f = cfg["filters"]
+    found, passed = [], []
+    for net in cfg["networks"]:
+        if net not in CHAINS:
+            log(f"skip unknown network '{net}'")
+            continue
+        pools = fetch_new_pools(net, cfg["pages_per_network"])
+        found += pools
+        log(f"{net}: {len(pools)} new pools")
+    # one entry per token: keep the pool with the most liquidity
+    best = {}
+    for p in found:
+        ok, _ = passes_filters(p, f)
+        if not ok:
+            continue
+        k = (p["network"], p["token"].lower())
+        if k not in best or p["liquidity"] > best[k]["liquidity"]:
+            best[k] = p
+    passed = list(best.values())
+    log(f"{len(passed)} of {len(found)} pools passed filters")
+
+    if passed:
+        enrich_dexscreener(passed)
+        run_security(passed)
+
+    now = datetime.now(timezone.utc).isoformat()
+    alerts = 0
+    for p in passed:
+        sec = p["security"]
+        if sec["fatal"] and f.get("drop_honeypots", True):
+            continue
+        if sec.get("sell_tax", 0) > f["max_sell_tax"]:
+            continue
+        score_token(p)
+        key = f"{p['network']}:{p['token'].lower()}"
+        prev = state["tokens"].get(key)
+        v = public_view(p)
+        v["first_seen"] = prev["first_seen"] if prev else now
+        v["first_score"] = prev["first_score"] if prev else p["score"]
+        v["last_seen"] = now
+        hist = (prev or {}).get("history", [])[-23:]
+        v["history"] = hist + [p["score"]]
+        state["tokens"][key] = v
+        tg = cfg["telegram"]
+        if (tg.get("enabled") and p["score"] >= tg.get("min_score", 70)
+                and key not in state["alerted"]):
+            telegram(cfg, alert_text(p))
+            state["alerted"].append(key)
+            alerts += 1
+
+    # forget old tokens
+    cutoff = time.time() - cfg["keep_tokens_hours"] * 3600
+    for key in list(state["tokens"]):
+        try:
+            ts = datetime.fromisoformat(state["tokens"][key]["last_seen"]).timestamp()
+        except (KeyError, ValueError):
+            ts = 0
+        if ts < cutoff:
+            del state["tokens"][key]
+    state["alerted"] = state["alerted"][-2000:]
+
+    meta = {
+        "scanned_at": now,
+        "pools_found": len(found),
+        "passed": len(passed),
+        "tracked": len(state["tokens"]),
+        "alerts": alerts,
+        "duration_s": round(time.time() - started, 1),
+        "interval_min": cfg["scan_interval_minutes"],
+        "networks": cfg["networks"],
+        "filters": f,
+        "demo": False,
+    }
+    return meta
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Token Scout scanner")
+    ap.add_argument("--config", default=os.path.join(HERE, "config.json"))
+    ap.add_argument("--once", action="store_true", help="run a single scan")
+    ap.add_argument("--demo", action="store_true", help="build dashboard from example data")
+    args = ap.parse_args()
+
+    with open(args.config) as fh:
+        cfg = json.load(fh)
+    state_path = os.path.join(HERE, "state.json")
+
+    if args.demo:
+        from demo_data import build_demo_state
+        state, meta = build_demo_state(cfg, score_token, public_view)
+        path = write_dashboard(cfg, state, meta)
+        log(f"demo dashboard written to {path}")
+        return
+
+    state = load_state(state_path)
+    while True:
+        try:
+            meta = scan(cfg, state)
+            save_state(state_path, state)
+            path = write_dashboard(cfg, state, meta)
+            log(f"dashboard updated: {path} ({meta['tracked']} tokens tracked)")
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log(f"scan error: {e!r}")
+        if args.once:
+            break
+        time.sleep(cfg["scan_interval_minutes"] * 60)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
