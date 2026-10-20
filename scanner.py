@@ -5,7 +5,7 @@ checks and scores each one 0-100. Writes a dashboard (output/index.html) every
 cycle and can send Telegram alerts for high scorers.
 
 Data sources (all free, no API key):
-  GeckoTerminal  new pools per chain
+  GeckoTerminal  new + trending pools per chain, and fresh data for watched pools
   DexScreener    website / socials / boosts for each token
   GoPlus         contract security for EVM chains
   RugCheck       contract security for Solana
@@ -107,55 +107,80 @@ def fnum(x, default=0.0):
 
 # ---------------------------------------------------------------- 1. discovery
 
+GT = "https://api.geckoterminal.com/api/v2/networks"
+
+
 def fetch_new_pools(network, pages):
     pools = []
     for page in range(1, pages + 1):
-        url = (f"https://api.geckoterminal.com/api/v2/networks/{network}/new_pools"
-               f"?page={page}&include=base_token,dex")
-        data = get_json(url)
+        data = get_json(f"{GT}/{network}/new_pools?page={page}&include=base_token,dex")
         if not data:
             break
-        tokens = {}
-        for inc in data.get("included", []) or []:
-            if inc.get("type") == "token":
-                tokens[inc["id"]] = inc.get("attributes", {})
-        for p in data.get("data", []) or []:
-            a = p.get("attributes", {})
-            rel = p.get("relationships", {})
-            tok_id = (rel.get("base_token", {}).get("data") or {}).get("id", "")
-            dex_id = (rel.get("dex", {}).get("data") or {}).get("id", "")
-            tok = tokens.get(tok_id, {})
-            tx_h1 = (a.get("transactions") or {}).get("h1") or {}
-            tx_m5 = (a.get("transactions") or {}).get("m5") or {}
-            vol = a.get("volume_usd") or {}
-            pc = a.get("price_change_percentage") or {}
-            token_addr = tok.get("address") or tok_id.split("_", 1)[-1]
-            pools.append({
-                "network": network,
-                "pool": a.get("address"),
-                "pair_name": a.get("name", ""),
-                "token": token_addr,
-                "name": tok.get("name") or a.get("name", "").split(" / ")[0],
-                "symbol": tok.get("symbol") or a.get("name", "").split(" / ")[0],
-                "dex": dex_id,
-                "created": a.get("pool_created_at"),
-                "price_usd": fnum(a.get("base_token_price_usd")),
-                "liquidity": fnum(a.get("reserve_in_usd")),
-                "fdv": fnum(a.get("fdv_usd")),
-                "mcap": fnum(a.get("market_cap_usd")),
-                "vol_m5": fnum(vol.get("m5")),
-                "vol_h1": fnum(vol.get("h1")),
-                "vol_h24": fnum(vol.get("h24")),
-                "chg_m5": fnum(pc.get("m5")),
-                "chg_h1": fnum(pc.get("h1")),
-                "chg_h24": fnum(pc.get("h24")),
-                "buys_h1": int(fnum(tx_h1.get("buys"))),
-                "sells_h1": int(fnum(tx_h1.get("sells"))),
-                "buyers_h1": int(fnum(tx_h1.get("buyers"))),
-                "sellers_h1": int(fnum(tx_h1.get("sellers"))),
-                "buys_m5": int(fnum(tx_m5.get("buys"))),
-                "sells_m5": int(fnum(tx_m5.get("sells"))),
-            })
+        pools += parse_pools(data, network)
+    return pools
+
+
+def fetch_trending_pools(network):
+    """Active pools of any age; catches tokens that left the new-pools pages
+    (a few minutes on Solana) before they were old enough to list."""
+    data = get_json(f"{GT}/{network}/trending_pools?duration=1h&include=base_token,dex")
+    return parse_pools(data, network) if data else []
+
+
+def fetch_pools(network, addresses):
+    """Current data for pools already on the watch list, 30 per call."""
+    pools = []
+    for i in range(0, len(addresses), 30):
+        data = get_json(f"{GT}/{network}/pools/multi/{','.join(addresses[i:i + 30])}"
+                        f"?include=base_token,dex")
+        if data:
+            pools += parse_pools(data, network)
+    return pools
+
+
+def parse_pools(data, network):
+    pools = []
+    tokens = {}
+    for inc in data.get("included", []) or []:
+        if inc.get("type") == "token":
+            tokens[inc["id"]] = inc.get("attributes", {})
+    for p in data.get("data", []) or []:
+        a = p.get("attributes", {})
+        rel = p.get("relationships", {})
+        tok_id = (rel.get("base_token", {}).get("data") or {}).get("id", "")
+        dex_id = (rel.get("dex", {}).get("data") or {}).get("id", "")
+        tok = tokens.get(tok_id, {})
+        tx_h1 = (a.get("transactions") or {}).get("h1") or {}
+        tx_m5 = (a.get("transactions") or {}).get("m5") or {}
+        vol = a.get("volume_usd") or {}
+        pc = a.get("price_change_percentage") or {}
+        token_addr = tok.get("address") or tok_id.split("_", 1)[-1]
+        pools.append({
+            "network": network,
+            "pool": a.get("address"),
+            "pair_name": a.get("name", ""),
+            "token": token_addr,
+            "name": tok.get("name") or a.get("name", "").split(" / ")[0],
+            "symbol": tok.get("symbol") or a.get("name", "").split(" / ")[0],
+            "dex": dex_id,
+            "created": a.get("pool_created_at"),
+            "price_usd": fnum(a.get("base_token_price_usd")),
+            "liquidity": fnum(a.get("reserve_in_usd")),
+            "fdv": fnum(a.get("fdv_usd")),
+            "mcap": fnum(a.get("market_cap_usd")),
+            "vol_m5": fnum(vol.get("m5")),
+            "vol_h1": fnum(vol.get("h1")),
+            "vol_h24": fnum(vol.get("h24")),
+            "chg_m5": fnum(pc.get("m5")),
+            "chg_h1": fnum(pc.get("h1")),
+            "chg_h24": fnum(pc.get("h24")),
+            "buys_h1": int(fnum(tx_h1.get("buys"))),
+            "sells_h1": int(fnum(tx_h1.get("sells"))),
+            "buyers_h1": int(fnum(tx_h1.get("buyers"))),
+            "sellers_h1": int(fnum(tx_h1.get("sellers"))),
+            "buys_m5": int(fnum(tx_m5.get("buys"))),
+            "sells_m5": int(fnum(tx_m5.get("sells"))),
+        })
     return pools
 
 
@@ -172,16 +197,13 @@ def age_minutes(created_iso):
 # ---------------------------------------------------------------- 2. hard filters
 
 def passes_filters(p, f):
+    # a token is at least as old as this pool, so "too old" is safe to decide here;
+    # "too new" waits for age_reasons() once the token's first pool is known
     age = age_minutes(p["created"])
     p["age_min"] = age
     reasons = []
-    if age is None:
-        reasons.append("unknown age")
-    else:
-        if age < f["min_age_minutes"]:
-            reasons.append("too new")
-        if age > f["max_age_hours"] * 60:
-            reasons.append("too old")
+    if age is not None and age > f["max_age_hours"] * 60:
+        reasons.append("too old")
     if p["liquidity"] < f["min_liquidity_usd"]:
         reasons.append("low liquidity")
     if p["liquidity"] > f["max_liquidity_usd"]:
@@ -198,27 +220,58 @@ def passes_filters(p, f):
     return not reasons, reasons
 
 
+def age_reasons(p, f):
+    """Age filters on the token's real age, after enrich_dexscreener() has set it."""
+    age = p["age_min"]
+    if age is None:
+        return ["unknown age"]
+    if age < f["min_age_minutes"]:
+        return ["too new"]
+    if age > f["max_age_hours"] * 60:
+        return ["too old"]
+    return []
+
+
 # ---------------------------------------------------------------- 3. enrichment
 
+def first_pool_gt(network, token):
+    """Creation time (epoch ms) of the oldest of the token's top 20 pools on GeckoTerminal."""
+    data = get_json(f"{GT}/{network}/tokens/{token}/pools")
+    times = []
+    for x in (data or {}).get("data") or []:
+        ts = iso_ts(((x.get("attributes") or {}).get("pool_created_at") or "").replace("Z", "+00:00"))
+        if ts:
+            times.append(ts)
+    return min(times) * 1000 if times else None
+
+
 def enrich_dexscreener(pools):
-    """Adds websites/socials/boosts from DexScreener, 30 tokens per call."""
-    addrs = list({p["token"] for p in pools if p["token"]})
+    """Adds websites/socials/boosts from DexScreener, and sets created/age_min to the
+    time the token's first pool opened on any DEX (the scanned pool may be a newer one).
+    One call per token: the multi-token endpoint returns at most 30 pairs in total."""
     info = {}
-    for i in range(0, len(addrs), 30):
-        chunk = addrs[i:i + 30]
-        data = get_json("https://api.dexscreener.com/latest/dex/tokens/" + ",".join(chunk))
-        for pair in (data or {}).get("pairs") or []:
-            addr = (pair.get("baseToken") or {}).get("address", "")
-            key = addr.lower()
+    for p in pools:
+        key = (p["network"], p["token"].lower())
+        if not p["token"] or key in info:
+            continue
+        chain = CHAINS.get(p["network"], (p["network"],))[0]
+        data = get_json(f"https://api.dexscreener.com/token-pairs/v1/{chain}/{p['token']}")
+        pairs = data if isinstance(data, list) else []
+        d = {}
+        first_ms = None
+        for pair in pairs:
+            created_ms = pair.get("pairCreatedAt")
+            if created_ms and (first_ms is None or created_ms < first_ms):
+                first_ms = created_ms
+            if (pair.get("baseToken") or {}).get("address", "").lower() != key[1]:
+                continue
+            d["pairs"] = d.get("pairs", 0) + 1
             liq = fnum((pair.get("liquidity") or {}).get("usd"))
-            prev = info.get(key)
-            if prev and prev["_liq"] >= liq and prev["socials"]:
-                prev["pairs"] += 1
+            if "_liq" in d and d["_liq"] >= liq and d["socials"]:
                 continue
             i_ = pair.get("info") or {}
-            info[key] = {
+            d.update({
                 "_liq": liq,
-                "pairs": (prev["pairs"] + 1) if prev else 1,
                 "websites": [w.get("url") for w in i_.get("websites") or [] if w.get("url")],
                 "socials": [{"type": (s.get("type") or s.get("platform") or "").lower(),
                              "url": s.get("url")} for s in i_.get("socials") or [] if s.get("url")],
@@ -226,9 +279,22 @@ def enrich_dexscreener(pools):
                 "boosts": int(fnum((pair.get("boosts") or {}).get("active"))),
                 "has_profile": bool(i_),
                 "ds_url": pair.get("url"),
-            }
+            })
+        # DexScreener lists at most 30 pools per token and may not know a token yet;
+        # then GeckoTerminal's pool list for the token can hold an older pool
+        if not pairs or len(pairs) >= 30:
+            gt_ms = first_pool_gt(p["network"], p["token"])
+            if gt_ms and (first_ms is None or gt_ms < first_ms):
+                first_ms = gt_ms
+        if first_ms:
+            d["first_pool"] = datetime.fromtimestamp(first_ms / 1000, timezone.utc).isoformat()
+        info[key] = d
     for p in pools:
-        d = info.get(p["token"].lower(), {})
+        d = info.get((p["network"], p["token"].lower()), {})
+        first = d.get("first_pool")
+        if first and (p["age_min"] is None or age_minutes(first) > p["age_min"]):
+            p["created"] = first
+        p["age_min"] = age_minutes(p["created"])
         p["websites"] = d.get("websites", [])
         p["socials"] = d.get("socials", [])
         p["image"] = d.get("image")
@@ -513,35 +579,88 @@ def public_view(p):
 
 # ---------------------------------------------------------------- main loop
 
+DETAILS = ("created", "websites", "socials", "image", "boosts", "has_profile",
+           "pair_count", "ds_url", "security")
+
+
+def iso_ts(iso):
+    try:
+        return datetime.fromisoformat(iso).timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
 def scan(cfg, state):
     started = time.time()
     f = cfg["filters"]
-    found, passed = [], []
+    now = datetime.now(timezone.utc).isoformat()
+    # pools re-checked every scan: new ones for watch_minutes, listed tokens for as
+    # long as they stay listed
+    watch = state.setdefault("watch", {})
+    checks = state.setdefault("checks", {})
+    for v in state["tokens"].values():
+        watch.setdefault(f"{v['network']}:{v['pool']}",
+                         {"network": v["network"], "pool": v["pool"], "found": iso_ts(v["first_seen"])})
+
+    seen = {}
     for net in cfg["networks"]:
         if net not in CHAINS:
             log(f"skip unknown network '{net}'")
             continue
-        pools = fetch_new_pools(net, cfg["pages_per_network"])
-        found += pools
-        log(f"{net}: {len(pools)} new pools")
+        new = fetch_new_pools(net, cfg["pages_per_network"])
+        trending = fetch_trending_pools(net)
+        for p in new + trending:
+            seen[f"{net}:{p['pool']}"] = p
+        log(f"{net}: {len(new)} new pools, {len(trending)} trending")
+    recheck = {}
+    for k, w in watch.items():
+        if k not in seen:
+            recheck.setdefault(w["network"], []).append(w["pool"])
+    for net, addrs in recheck.items():
+        for p in fetch_pools(net, addrs):
+            seen[f"{net}:{p['pool']}"] = p
+    found = list(seen.values())
+    log(f"{len(found)} pools checked, {sum(map(len, recheck.values()))} of them from the watch list")
+
     # one entry per token: keep the pool with the most liquidity
     best = {}
-    for p in found:
-        ok, _ = passes_filters(p, f)
+    for k, p in seen.items():
+        ok, reasons = passes_filters(p, f)
+        if k not in watch and "too old" not in reasons:
+            watch[k] = {"network": p["network"], "pool": p["pool"], "found": started}
         if not ok:
             continue
-        k = (p["network"], p["token"].lower())
-        if k not in best or p["liquidity"] > best[k]["liquidity"]:
-            best[k] = p
+        tk = (p["network"], p["token"].lower())
+        if tk not in best or p["liquidity"] > best[tk]["liquidity"]:
+            best[tk] = p
     passed = list(best.values())
     log(f"{len(passed)} of {len(found)} pools passed filters")
 
-    if passed:
-        enrich_dexscreener(passed)
-        run_security(passed)
+    # DexScreener and security results are reused for details_refresh_minutes
+    fresh_after = started - cfg.get("details_refresh_minutes", 30) * 60
+    stale = []
+    for p in passed:
+        c = checks.get(f"{p['network']}:{p['token'].lower()}")
+        if c and c["at"] > fresh_after:
+            p.update(c["details"])
+            p["age_min"] = age_minutes(p["created"])
+        else:
+            stale.append(p)
+    if stale:
+        enrich_dexscreener(stale)
+    young = [p for p in passed if not age_reasons(p, f)]
+    if len(young) < len(passed):
+        log(f"{len(passed) - len(young)} dropped on token age (first pool on any DEX)")
+    passed = young
+    unchecked = [p for p in passed if "security" not in p]
+    if unchecked:
+        run_security(unchecked)
+        for p in unchecked:
+            checks[f"{p['network']}:{p['token'].lower()}"] = {
+                "at": started, "details": {k: p[k] for k in DETAILS}}
 
-    now = datetime.now(timezone.utc).isoformat()
     alerts = 0
+    listed = set()
     for p in passed:
         sec = p["security"]
         if sec["fatal"] and f.get("drop_honeypots", True):
@@ -550,6 +669,7 @@ def scan(cfg, state):
             continue
         score_token(p)
         key = f"{p['network']}:{p['token'].lower()}"
+        listed.add(key)
         prev = state["tokens"].get(key)
         v = public_view(p)
         v["first_seen"] = prev["first_seen"] if prev else now
@@ -565,20 +685,36 @@ def scan(cfg, state):
             state["alerted"].append(key)
             alerts += 1
 
-    # forget old tokens
-    cutoff = time.time() - cfg["keep_tokens_hours"] * 3600
-    for key in list(state["tokens"]):
-        try:
-            ts = datetime.fromisoformat(state["tokens"][key]["last_seen"]).timestamp()
-        except (KeyError, ValueError):
-            ts = 0
-        if ts < cutoff:
+    # a token stays listed only while it meets the filters; if its pool could not be
+    # fetched this scan it is kept as it was, for up to 3 scan intervals
+    missing_cutoff = started - 3 * cfg["scan_interval_minutes"] * 60
+    dropped = 0
+    for key, v in list(state["tokens"].items()):
+        if key in listed:
+            continue
+        if f"{v['network']}:{v['pool']}" in seen or iso_ts(v["last_seen"]) < missing_cutoff:
             del state["tokens"][key]
+            dropped += 1
+    if dropped:
+        log(f"{dropped} tokens no longer meet the filters and were removed")
+    for key in list(checks):
+        if key not in state["tokens"]:
+            del checks[key]
+
+    # stop watching pools that are past the age range or never qualified in watch_minutes
+    keep = {f"{v['network']}:{v['pool']}" for v in state["tokens"].values()}
+    give_up = started - cfg.get("watch_minutes", 60) * 60
+    for k, w in list(watch.items()):
+        p = seen.get(k)
+        too_old = p is not None and p["age_min"] is not None and p["age_min"] > f["max_age_hours"] * 60
+        if k not in keep and (too_old or w["found"] < give_up):
+            del watch[k]
     state["alerted"] = state["alerted"][-2000:]
 
     meta = {
         "scanned_at": now,
         "pools_found": len(found),
+        "watching": len(watch),
         "passed": len(passed),
         "tracked": len(state["tokens"]),
         "alerts": alerts,

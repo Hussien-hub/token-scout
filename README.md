@@ -25,14 +25,25 @@ The page reloads itself after each scan and keeps your filters.
 
 ## How a token gets into the list
 
-1. **Discovery** – GeckoTerminal `new_pools` for every chain in `networks`
+1. **Discovery** – GeckoTerminal `new_pools` and the 1h `trending_pools` for every chain in `networks`
    (solana, base, bsc, eth, arbitrum, polygon_pos).
+   New pools leave those pages fast (on Solana 2 pages cover only the last ~5 minutes), so every
+   pool found goes on a **watch list** and is re-checked each scan for `watch_minutes`.
+   That is how a pool found at 4 minutes old gets listed once it passes `min_age_minutes`.
 2. **Hard filters** (`filters` in config.json) – age, liquidity, FDV range, 1h volume, 1h txns.
    One entry per token (the pool with the most liquidity).
 3. **Enrichment** – DexScreener adds website, X, Telegram, Discord and paid boosts.
+   It also gives the token's real age: all of the token's pools are looked up and the *oldest*
+   one counts. A new pool can belong to an old token, so the age filters are checked again on this age.
+   DexScreener lists at most 30 pools per token; when it hits that limit or doesn't know the token yet,
+   GeckoTerminal's pool list for the token is checked too.
 4. **Security** – GoPlus for EVM chains, RugCheck for Solana.
    Honeypots, freeze authority and sell tax above `max_sell_tax` are dropped.
 5. **Score**
+6. **Stay or go** – every listed token is re-checked on each scan and stays only while it still
+   meets all of the above. It is removed once it fails them (liquidity pulled, activity gone,
+   older than `max_age_hours`, turned into a honeypot). DexScreener and security results are
+   reused for `details_refresh_minutes`; liquidity, volume, txns and price refresh every scan.
 
 | Part | Max | What counts |
 |---|---|---|
@@ -75,13 +86,17 @@ journalctl -u token-scout -f
 ## Rate limits
 
 GeckoTerminal's free API allows about 30 calls per minute, so the scanner waits ~2.2 s between calls.
-4 chains × 2 pages = 8 calls per scan. RugCheck is called once per Solana token that passed the filters.
-If you add chains or pages, keep the scan interval at 5 minutes or more.
+Per scan: 4 chains × (2 new-pool pages + 1 trending page) = 12 calls, plus 1 call per 30 watched pools
+(a few hundred pools with the default `watch_minutes`, mostly Solana). DexScreener and the security
+check run once per token, then again every `details_refresh_minutes` while it is listed.
+If you add chains or pages, or raise `watch_minutes`, keep the scan interval at 5 minutes or more.
 
 ## Tuning
 
 - Too many tokens: raise `min_liquidity_usd`, `min_txns_h1` or `min_age_minutes`.
 - Want earlier entries: lower `min_age_minutes` (more rugs get through in the first 30 minutes).
+- Tokens that take off later than an hour after their pool opened: raise `watch_minutes`
+  (more API calls per scan). Active ones are also picked up from the trending list.
 - Scoring weights live in `score_token()` in scanner.py.
 
 A high score only means the token passed automated checks. Always read the contract, the team and the docs yourself.

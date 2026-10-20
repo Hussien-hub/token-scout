@@ -2,7 +2,8 @@
   "networks": ["solana", "base", "bsc", "eth"],
   "pages_per_network": 2,
   "scan_interval_minutes": 5,
-  "keep_tokens_hours": 48,
+  "watch_minutes": 60,
+  "details_refresh_minutes": 30,
 
   "filters": {
     "min_age_minutes": 20,

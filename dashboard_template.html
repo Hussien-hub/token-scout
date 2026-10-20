@@ -228,12 +228,13 @@ const usd = (x) => {
   if (x >= 1e3) return "$" + (x / 1e3).toFixed(1) + "k";
   return "$" + x.toFixed(0);
 };
+// minutes since the token's first pool opened; age_min goes stale once a token leaves the new-pools list
+const ageMin = (t) => { const ms = Date.parse(t.created); return isNaN(ms) ? null : (Date.now() - ms) / 60000; };
 const age = (m) => {
   if (m == null) return "–";
-  const live = m + (Date.now() - new Date(DATA.meta.scanned_at || Date.now())) / 60000;
-  if (live < 60) return Math.round(live) + "m";
-  if (live < 1440) return (live / 60).toFixed(1) + "h";
-  return (live / 1440).toFixed(1) + "d";
+  if (m < 60) return Math.round(m) + "m";
+  if (m < 1440) return (m / 60).toFixed(1) + "h";
+  return (m / 1440).toFixed(1) + "d";
 };
 const pct = (x) => (x > 0 ? "+" : "") + (x || 0).toFixed(0) + "%";
 const ago = (iso) => {
@@ -295,7 +296,7 @@ function filtered() {
     return true;
   });
   const key = state.sort;
-  const val = (t) => (key === "txns" ? t.buys_h1 + t.sells_h1 : key === "fdv" ? t.fdv || t.mcap : t[key] ?? 0);
+  const val = (t) => (key === "txns" ? t.buys_h1 + t.sells_h1 : key === "fdv" ? t.fdv || t.mcap : key === "age_min" ? ageMin(t) ?? 0 : t[key] ?? 0);
   list.sort((a, b) => (val(a) - val(b)) * state.dir);
   return list;
 }
@@ -361,7 +362,7 @@ function renderRows() {
     return `<tr class="row" data-key="${esc(key)}" aria-expanded="${open}" tabindex="0">
       <td><span class="score ${band(t.score)}">${t.score}</span>${d ? `<span class="delta">${d > 0 ? "▲" : "▼"} ${Math.abs(d)}</span>` : ""}</td>
       <td><div class="tok"><div class="avatar">${img}</div><div style="min-width:0"><div><span class="sym">${esc(t.symbol)}</span><span class="net">${esc(t.network)}</span></div><div class="nm">${esc(t.name)}</div></div></div></td>
-      <td class="num">${age(t.age_min)}</td>
+      <td class="num">${age(ageMin(t))}</td>
       <td class="num">${usd(t.liquidity)}</td>
       <td class="num">${usd(t.fdv || t.mcap)}</td>
       <td class="num">${usd(t.vol_h1)}</td>
