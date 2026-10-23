@@ -125,13 +125,19 @@ tr.detail td { background: var(--accent-soft); padding: 4px 16px 18px; }
 .dgrid { display: grid; grid-template-columns: minmax(240px, 1.1fr) minmax(220px, 1fr) minmax(200px, 0.9fr); gap: 24px; }
 .dgrid > div { min-width: 0; }
 .dgrid h4 { margin: 8px 0 10px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-.part { display: grid; grid-template-columns: 78px 1fr 56px; align-items: center; gap: 10px; margin-bottom: 7px; font-size: 13px; }
+.part { display: grid; grid-template-columns: 104px 1fr 56px; align-items: center; gap: 10px; margin-bottom: 7px; font-size: 13px; }
 .part .track { height: 8px; background: var(--panel); border-radius: 4px; overflow: hidden; }
 .part .fill { height: 100%; background: var(--accent); border-radius: 4px; }
 .part .pv { font-family: var(--font-data); font-size: 12px; text-align: right; color: var(--muted); }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; font-family: var(--font-data); font-size: 12px; word-break: break-all; }
+.new { margin-left: 4px; padding: 1px 4px; border-radius: 4px; font-size: 9px; font-weight: 700; letter-spacing: 0.04em; background: var(--accent); color: var(--panel); vertical-align: 1px; }
+.why, .events { list-style: none; margin: 2px 0 10px; padding: 0; font-size: 12px; color: var(--muted); }
+.why li, .events li { padding: 2px 0; }
+.why b { font-family: var(--font-data); font-weight: 500; color: var(--fg); }
+.events span { font-family: var(--font-data); margin-right: 6px; }
+.note { margin: 2px 0 10px; font-size: 12px; color: var(--muted); }
 .links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .links a { font-size: 12px; text-decoration: none; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); }
 .links a:hover { border-color: var(--accent); }
@@ -171,6 +177,9 @@ footer code { font-family: var(--font-data); font-size: 11px; }
     <label class="ctl" for="minScore">Min score <input id="minScore" type="range" min="0" max="90" step="5" value="0"><output id="minScoreOut">0</output></label>
     <label class="ctl"><input id="hideDanger" type="checkbox"> Hide red flags</label>
     <label class="ctl"><input id="needSocial" type="checkbox"> Has website or socials</label>
+    <label class="ctl"><input id="hideFarm" type="checkbox"> Hide farm launches</label>
+    <label class="ctl"><input id="hideDumped" type="checkbox"> Hide dev-dumped</label>
+    <label class="ctl"><input id="onlyHolding" type="checkbox"> Only dev holding</label>
   </section>
 
   <div class="tablebox">
@@ -186,6 +195,7 @@ footer code { font-family: var(--font-data); font-size: 11px; }
           <th class="num"><button data-sort="txns">Txns 1h</button></th>
           <th class="num"><button data-sort="chg_h1">1h</button></th>
           <th>Signals</th>
+          <th>Dev</th>
           <th>Flags</th>
         </tr>
       </thead>
@@ -195,7 +205,7 @@ footer code { font-family: var(--font-data); font-size: 11px; }
   </div>
 
   <footer>
-    Score = safety 35 + liquidity 15 + activity 20 + momentum 10 + project signals 20. Honeypots and high sell taxes are removed before scoring.
+    Score = safety 25 + liquidity 15 + activity 15 + momentum 5 + project signals 15 + dev &amp; insiders 25 (Solana pump.fun tokens; others get a neutral 10). Honeypots and high sell taxes are removed before scoring.
     A high score means the token passed the automated checks, not that the project is good. Read the contract, the team and the docs before buying.
   </footer>
 </div>
@@ -216,6 +226,9 @@ const state = {
   minScore: store.get("minScore", 0),
   hideDanger: store.get("hideDanger", false),
   needSocial: store.get("needSocial", false),
+  hideFarm: store.get("hideFarm", false),
+  hideDumped: store.get("hideDumped", false),
+  onlyHolding: store.get("onlyHolding", false),
   sort: store.get("sort", "score"),
   dir: store.get("dir", -1),
   open: new Set(),
@@ -247,7 +260,69 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const safeUrl = (u) => (typeof u === "string" && /^https?:\/\//i.test(u) ? u : "#");
 const band = (s) => (s >= 70 ? "s-hi" : s >= 50 ? "s-md" : "s-lo");
 
-const PARTS = [["safety", "Safety", 35], ["liquidity", "Liquidity", 15], ["activity", "Activity", 20], ["momentum", "Momentum", 10], ["project", "Project", 20]];
+const PARTS = [["safety", "Safety", 25], ["liquidity", "Liquidity", 15], ["activity", "Activity", 15], ["momentum", "Momentum", 5], ["project", "Project", 15], ["dev", "Dev & insiders", 25]];
+
+// on-chain dev & insider results (Solana pump.fun tokens); flags are [id, level, text, points]
+const devIds = (t) => new Set(((t.onchain && t.onchain.flags) || []).map((f) => f[0]));
+const dur = (s) => (s == null ? "?" : s < 90 ? Math.round(s) + "s" : s < 5400 ? Math.round(s / 60) + "m" : (s / 3600).toFixed(1) + "h");
+const kfmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+// flag texts that appeared on a re-check in the last 30 min
+const newTexts = (t) => {
+  const o = t.onchain || {};
+  const fresh = Object.entries(o.new || {}).filter(([, ts]) => Date.now() / 1000 - ts < 1800).map(([k]) => k);
+  return new Set((o.flags || []).filter((f) => fresh.includes(f[0])).map((f) => f[2]));
+};
+const NEW = '<b class="new">NEW</b>';
+
+function devBadges(t) {
+  const o = t.onchain;
+  if (t.network !== "solana") return [["info", "Solana only"]];
+  if (!o) return [["info", "checking…"]];
+  if (o.status === "n/a") return [["info", "not pump.fun"]];
+  if (o.status !== "done") return [["info", "unavailable"]];
+  const b = [];
+  if (o.dev_sold_pct >= 80) b.push(["danger", `Dumped ${o.dev_sold_pct.toFixed(0)}% @${dur(o.dev_first_sell_sec)}`]);
+  else if (o.dev_initial_pct > 0) b.push(["good", `Holding ${Math.min(100, (o.dev_current_pct / o.dev_initial_pct) * 100).toFixed(0)}%`]);
+  else b.push(["info", "No dev buy"]);
+  if (o.funded >= 100) b.push([o.funded >= 500 ? "danger" : "warn", `Farm (${kfmt(o.funded)}${o.funded_capped ? "+" : ""})`]);
+  return b;
+}
+
+function devDetail(t) {
+  const o = t.onchain;
+  if (!o || o.status !== "done") {
+    const why = t.network === "solana" ? (o && o.error ? `last check failed: ${esc(o.error)}` : "") : "on-chain checks cover Solana pump.fun tokens";
+    return `<h4>Dev &amp; insiders</h4><p class="note">${esc(devBadges(t)[0][1])}${why ? " · " + why : ""}</p>`;
+  }
+  const acct = (a) => `<a href="https://solscan.io/account/${esc(a)}" target="_blank" rel="noopener">${esc(a.slice(0, 4))}…${esc(a.slice(-4))}</a>`;
+  const pc = (x) => (x == null ? "?" : x.toFixed(1) + "%");
+  const ev = (o.events || []).slice().reverse().map(([ts, text]) =>
+    `<li><span>${new Date(ts * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>${esc(text)}</li>`).join("");
+  return `<h4>Dev &amp; insiders</h4><dl class="kv">
+      <dt>Creator</dt><dd>${acct(o.creator)}</dd>
+      <dt>Dev bought</dt><dd>${pc(o.dev_initial_pct)} at launch</dd>
+      <dt>Dev sold</dt><dd>${o.dev_sold_pct == null ? "–" : o.dev_sold_pct.toFixed(0) + "%"}${o.dev_first_sell_sec != null ? `, first sell ${dur(o.dev_first_sell_sec)} after create` : ""}</dd>
+      <dt>Dev holds now</dt><dd>${pc(o.dev_current_pct)}</dd>
+      <dt>Wallets funded</dt><dd>≈ ${o.funded.toLocaleString()}${o.funded_capped ? "+" : ""}</dd>
+      <dt>Funded by</dt><dd>${o.funder ? acct(o.funder) + (o.funder_txs >= 1000 ? " · busy hot wallet (exchange or swap service?)" : ` · ${o.funder_txs} txs`) : "unknown"}</dd>
+      <dt>Curve filled</dt><dd>${o.curve_sec == null ? "still on the curve" : dur(o.curve_sec) + " after create"}</dd>
+      <dt>Insiders now / peak</dt><dd>${pc(o.insider_pct_now)} / ${pc(o.insider_pct_peak)}</dd>
+      ${o.launch_tool ? `<dt>Launch tool</dt><dd>${esc(o.launch_tool)}</dd>` : ""}
+      <dt>Checked</dt><dd>${ago(new Date(o.checked_at * 1000))}${o.error ? " (last re-check failed)" : ""}</dd>
+    </dl>${ev ? `<h4>Changes</h4><ul class="events">${ev}</ul>` : ""}`;
+}
+
+// why the Dev & insiders part scored what it did, and any cap on the total
+function devWhy(t) {
+  const o = t.onchain;
+  if (!o || o.status !== "done") return `<p class="note">Dev &amp; insiders: neutral 10/25 (${esc(devBadges(t)[0][1])})</p>`;
+  const ids = devIds(t);
+  const cap = ids.has("dumped") && ids.has("farm") ? "Total capped at 40: dev dumped + wallet farm"
+    : o.insider_pct_now >= 20 ? "Total capped at 50: insiders hold 20%+"
+    : ids.has("bundled") ? "Total capped at 55: bundled launch" : "";
+  const rows = o.flags.filter((f) => f[3]).map((f) => `<li>${esc(f[2])} <b>${f[3] > 0 ? "+" : ""}${f[3]}</b></li>`).join("");
+  return `<p class="note">Dev &amp; insiders starts at 15:</p><ul class="why">${rows || "<li>no changes</li>"}</ul>${cap ? `<p class="note">${cap}</p>` : ""}`;
+}
 
 function socialSet(t) {
   const s = new Set((t.socials || []).map((x) => (x.type === "x" ? "twitter" : x.type)));
@@ -292,6 +367,10 @@ function filtered() {
     if (t.score < state.minScore) return false;
     if (state.hideDanger && (t.flags || []).some((f) => f[0] === "danger")) return false;
     if (state.needSocial && socialSet(t).size === 0) return false;
+    const ids = devIds(t);
+    if (state.hideFarm && (ids.has("farm") || ids.has("likely_farm"))) return false;
+    if (state.hideDumped && (ids.has("dumped") || ids.has("sold_most"))) return false;
+    if (state.onlyHolding && !ids.has("holding")) return false;
     if (q && !(`${t.symbol} ${t.name} ${t.token}`.toLowerCase().includes(q))) return false;
     return true;
   });
@@ -321,12 +400,13 @@ function detailRow(t) {
     const v = (t.parts || {})[k] || 0;
     return `<div class="part"><span>${label}</span><div class="track"><div class="fill" style="width:${(v / max) * 100}%"></div></div><span class="pv">${v.toFixed(0)}/${max}</span></div>`;
   }).join("");
-  const flags = (t.flags || []).map((f) => `<span class="flag f-${esc(f[0])}">${esc(f[1])}</span>`).join("") || '<span class="flag f-good">No flags</span>';
+  const fresh = newTexts(t);
+  const flags = (t.flags || []).map((f) => `<span class="flag f-${esc(f[0])}">${esc(f[1])}${fresh.has(f[1]) ? NEW : ""}</span>`).join("") || '<span class="flag f-good">No flags</span>';
   const soc = [...(t.websites || []).map((u) => ["Website", u]), ...(t.socials || []).map((s) => [s.type, s.url])];
   const links = [["DexScreener", t.ds_url], ["GeckoTerminal", t.gt_url], ["Explorer", t.explorer], ["RugCheck", t.rugcheck_url], ...soc]
     .filter(([, u]) => u).map(([l, u]) => `<a href="${esc(safeUrl(u))}" target="_blank" rel="noopener">${esc(l)}</a>`).join("");
-  return `<tr class="detail"><td colspan="10"><div class="dgrid">
-    <div><h4>Score breakdown</h4>${parts}<h4>Flags</h4><div class="flags" style="max-width:none">${flags}</div></div>
+  return `<tr class="detail"><td colspan="11"><div class="dgrid">
+    <div><h4>Score breakdown</h4>${parts}${devWhy(t)}<h4>Flags</h4><div class="flags" style="max-width:none">${flags}</div></div>
     <div><h4>Details</h4><dl class="kv">
       <dt>Contract</dt><dd>${esc(t.token)}</dd>
       <dt>DEX</dt><dd>${esc(t.dex)}</dd>
@@ -339,7 +419,7 @@ function detailRow(t) {
       <dt>First seen</dt><dd>${ago(t.first_seen)} at score ${t.first_score}</dd>
     </dl>
     <div class="links">${links}<button class="copy" data-copy="${esc(t.token)}">Copy address</button></div></div>
-    <div><h4>Score trend</h4>${spark(t.history)}</div>
+    <div><h4>Score trend</h4>${spark(t.history)}${devDetail(t)}</div>
   </div></td></tr>`;
 }
 
@@ -353,7 +433,9 @@ function renderRows() {
     const s = socialSet(t);
     const sig = [["web", "WEB"], ["twitter", "X"], ["telegram", "TG"], ["discord", "DC"]].map(([k, l]) => `<span class="${s.has(k) ? "on" : ""}">${l}</span>`).join("");
     const bad = (t.flags || []).filter((f) => f[0] !== "good").sort((a, b) => (a[0] === "danger" ? -1 : 1));
-    const shown = bad.slice(0, 2).map((f) => `<span class="flag f-${esc(f[0])}">${esc(f[1])}</span>`).join("") + (bad.length > 2 ? `<span class="flag f-info">+${bad.length - 2}</span>` : "");
+    const fresh = newTexts(t);
+    const shown = bad.slice(0, 2).map((f) => `<span class="flag f-${esc(f[0])}">${esc(f[1])}${fresh.has(f[1]) ? NEW : ""}</span>`).join("") + (bad.length > 2 ? `<span class="flag f-info">+${bad.length - 2}</span>` : "");
+    const dev = devBadges(t).map(([lv, text]) => `<span class="flag f-${lv}">${esc(text)}</span>`).join("") + (fresh.size ? NEW : "");
     const tx = t.buys_h1 + t.sells_h1;
     const buyShare = tx ? (t.buys_h1 / tx) * 100 : 50;
     const d = t.score - (t.first_score ?? t.score);
@@ -369,13 +451,14 @@ function renderRows() {
       <td class="num">${tx}<div class="bsbar" title="${t.buys_h1} buys / ${t.sells_h1} sells"><i style="width:${buyShare}%"></i></div></td>
       <td class="num ${t.chg_h1 >= 0 ? "up" : "down"}">${pct(t.chg_h1)}</td>
       <td><div class="sig">${sig}</div></td>
+      <td><div class="flags">${dev}</div></td>
       <td><div class="flags">${shown || '<span class="flag f-good">Clean</span>'}</div></td>
     </tr>${open ? detailRow(t) : ""}`;
   }).join("");
 }
 
 function persist() {
-  ["chains", "minScore", "hideDanger", "needSocial", "sort", "dir"].forEach((k) => store.set(k, state[k]));
+  ["chains", "minScore", "hideDanger", "needSocial", "hideFarm", "hideDumped", "onlyHolding", "sort", "dir"].forEach((k) => store.set(k, state[k]));
 }
 
 function bind() {
@@ -385,6 +468,10 @@ function bind() {
   $("minScore").addEventListener("input", (e) => { state.minScore = +e.target.value; $("minScoreOut").value = e.target.value; persist(); renderRows(); });
   $("hideDanger").addEventListener("change", (e) => { state.hideDanger = e.target.checked; persist(); renderRows(); });
   $("needSocial").addEventListener("change", (e) => { state.needSocial = e.target.checked; persist(); renderRows(); });
+  ["hideFarm", "hideDumped", "onlyHolding"].forEach((k) => {
+    $(k).checked = state[k];
+    $(k).addEventListener("change", (e) => { state[k] = e.target.checked; persist(); renderRows(); });
+  });
   $("chains").addEventListener("click", (e) => {
     const b = e.target.closest(".chip"); if (!b) return;
     const n = b.dataset.net;

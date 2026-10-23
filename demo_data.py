@@ -3,6 +3,8 @@
 import random
 from datetime import datetime, timedelta, timezone
 
+from onchain import flags_for
+
 EXAMPLES = [
     # name, symbol, network, dex, age_min, liq, fdv, vol_h1, chg_h1, buys, sells, buyers, sellers, web, socials, sec
     ("Lumen Relay", "LUMR", "base", "aerodrome", 210, 182000, 1450000, 96000, 34, 640, 410, 380, 250, True, ["twitter", "telegram", "discord"], "clean_lp"),
@@ -29,6 +31,33 @@ SEC = {
     "concentrated": (18, [("danger", "Top holders own 62%"), ("warn", "LP locked only 20%")]),
     "honeypot": (0, [("danger", "Honeypot")]),
 }
+
+# on-chain dev & insider results for the Solana examples; SALT is not a pump.fun token, FERRIS is still being checked
+ONCHAIN = {
+    "QRY": dict(dev_initial_pct=3.1, dev_current_pct=2.9, dev_sold_pct=6.0, dev_sold_10m_pct=0.0, dev_first_sell_sec=4100,
+                funded=12, funded_capped=False, curve_sec=1800, insider_pct_now=3.2, insider_pct_peak=4.0,
+                round_allocations=0, launch_tool=None, holders=2400),
+    "KILN": dict(dev_initial_pct=15.4, dev_current_pct=0.0, dev_sold_pct=100.0, dev_sold_10m_pct=100.0, dev_first_sell_sec=40,
+                 funded=24800, funded_capped=True, curve_sec=35, insider_pct_now=1.1, insider_pct_peak=17.5,
+                 round_allocations=4, launch_tool="j7tracker", holders=900),
+}
+
+
+def demo_onchain(sym, now, age):
+    if sym == "SALT":
+        return {"status": "n/a"}
+    if sym not in ONCHAIN:
+        return None
+    ts = now.timestamp()
+    o = dict(ONCHAIN[sym], status="done", creator="DemoCreator1111111111111111111111111111111",
+             created=ts - age * 60, checked_at=ts - 240, funder=None, funder_txs=None, events=[], new={})
+    o["flags"] = flags_for(o, None, ts)
+    if sym == "KILN":
+        exited = next(f for f in o["flags"] if f[0] == "insiders_exited")
+        o["events"] = [[ts - 600, exited[2]]]
+        o["new"] = {exited[0]: ts - 600}
+    return o
+
 
 SOCIAL_URLS = {"twitter": "https://x.com/", "telegram": "https://t.me/", "discord": "https://discord.gg/"}
 
@@ -57,6 +86,8 @@ def build_demo_state(cfg, score_token, public_view):
                          "flags": list(flags), "sell_tax": 0.0,
                          "holders": rng.randint(150, 2400)},
         }
+        if net == "solana":
+            p["onchain"] = demo_onchain(sym, now, age)
         score_token(p)
         v = public_view(p)
         v["ds_url"] = "https://dexscreener.com/"

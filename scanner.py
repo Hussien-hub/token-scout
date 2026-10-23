@@ -9,6 +9,7 @@ Data sources (all free, no API key):
   DexScreener    website / socials / boosts for each token
   GoPlus         contract security for EVM chains
   RugCheck       contract security for Solana
+  Solana RPC     dev & insider behaviour of pump.fun tokens (onchain.py, background thread)
 
 Usage:
   python3 scanner.py            # run forever, one scan every N minutes
@@ -23,13 +24,31 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
+import onchain
+
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_env(path):
+    """KEY=VALUE lines from .env into the environment; real environment variables win."""
+    try:
+        with open(path) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and not k.startswith("#"):
+                    os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+    except OSError:
+        pass
+
+
+load_env(os.path.join(HERE, ".env"))
 
 # GeckoTerminal network id -> (DexScreener chain id, GoPlus chain id or "solana", explorer token URL)
 CHAINS = {
@@ -41,7 +60,7 @@ CHAINS = {
     "polygon_pos": ("polygon",  "137",    "https://polygonscan.com/token/{}"),
 }
 
-UA = {"User-Agent": "token-scout/1.0", "Accept": "application/json"}
+UA = {"User-Agent": "token-scout/1.0", "Accept": "application/json", "Content-Type": "application/json"}
 
 
 # ---------------------------------------------------------------- http helpers
@@ -51,14 +70,15 @@ class RateLimiter:
 
     def __init__(self, gaps):
         self.gaps = gaps
-        self.last = {}
+        self.next = {}
+        self.lock = threading.Lock()
 
     def wait(self, host):
-        gap = self.gaps.get(host, 0.3)
-        delta = time.time() - self.last.get(host, 0)
-        if delta < gap:
-            time.sleep(gap - delta)
-        self.last[host] = time.time()
+        # the scan and the on-chain worker share this from two threads: reserve a slot, sleep outside the lock
+        with self.lock:
+            t = max(time.time(), self.next.get(host, 0))
+            self.next[host] = t + self.gaps.get(host, 0.3)
+        time.sleep(max(0, t - time.time()))
 
 
 LIMITER = RateLimiter({
@@ -66,15 +86,18 @@ LIMITER = RateLimiter({
     "api.dexscreener.com": 0.4,
     "api.gopluslabs.io": 1.2,
     "api.rugcheck.xyz": 1.0,
+    "api.mainnet-beta.solana.com": 0.5,   # public RPC; faster RPCs (SOLANA_RPC_URL) use the 0.3 s default
 })
 
 
-def get_json(url, retries=3):
+def get_json(url, retries=3, body=None):
+    """GET, or POST when body is given. None after retries; logs never show the
+    query string, where RPC providers put API keys."""
     host = urllib.parse.urlparse(url).netloc
     for attempt in range(retries):
         LIMITER.wait(host)
         try:
-            req = urllib.request.Request(url, headers=UA)
+            req = urllib.request.Request(url, data=body, headers=UA)
             with urllib.request.urlopen(req, timeout=20) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
@@ -84,12 +107,15 @@ def get_json(url, retries=3):
             if e.code in (500, 502, 503, 504):
                 time.sleep(3 * (attempt + 1))
                 continue
-            log(f"HTTP {e.code} for {url}")
+            log(f"HTTP {e.code} for {url.split('?')[0]}")
             return None
         except Exception as e:  # network errors, bad json
-            log(f"request failed ({e.__class__.__name__}) for {url}")
+            log(f"request failed ({e.__class__.__name__}) for {url.split('?')[0]}")
             time.sleep(2 * (attempt + 1))
     return None
+
+
+onchain.http = get_json
 
 
 def log(msg):
@@ -413,13 +439,14 @@ def clamp(x, lo, hi):
 
 
 def score_token(p):
-    """Returns total 0-100 and the five component scores."""
+    """Returns total 0-100 and the six component scores. The first five keep their
+    original point scales and are scaled down to make room for Dev & insiders."""
     sec = p["security"]
     flags = list(sec["flags"])
 
-    # Safety, max 35
+    # Safety, max 25 (penalties are on the original 35-point scale)
     safety = 35 - sec["penalty"] if sec["checked"] else 14
-    safety = clamp(safety, 0, 35)
+    safety = clamp(safety, 0, 35) * 25 / 35
 
     # Liquidity, max 15: depth on a log scale ($10k -> 0, ~$500k -> 12) + ratio to FDV
     liq = p["liquidity"]
@@ -431,7 +458,7 @@ def score_token(p):
         flags.append(("warn", f"Thin liquidity vs FDV ({ratio:.1%})"))
     liquidity = depth + ratio_pts
 
-    # Activity, max 20: unique buyers, txns, buy/sell balance
+    # Activity, max 15: unique buyers, txns, buy/sell balance
     buyers = p["buyers_h1"] or p["buys_h1"]
     txns = p["buys_h1"] + p["sells_h1"]
     buyer_pts = clamp(math.log10(max(buyers, 1)) / math.log10(400) * 8, 0, 8)
@@ -448,9 +475,9 @@ def score_token(p):
     if txns > 80 and buyers and txns / max(buyers + p["sellers_h1"], 1) > 6:
         bs_pts = 0
         flags.append(("warn", "Few wallets, many txns"))
-    activity = buyer_pts + txn_pts + bs_pts
+    activity = (buyer_pts + txn_pts + bs_pts) * 15 / 20
 
-    # Momentum, max 10: volume turnover + healthy price move
+    # Momentum, max 5: volume turnover + healthy price move
     turnover = p["vol_h1"] / max(liq, 1)
     turn_pts = clamp(turnover / 0.5 * 5, 0, 5)
     chg = p["chg_h1"]
@@ -464,9 +491,9 @@ def score_token(p):
             flags.append(("warn", f"Already pumped {chg:.0f}% in 1h"))
         else:
             flags.append(("warn", f"Dumping {chg:.0f}% in 1h"))
-    momentum = turn_pts + chg_pts
+    momentum = (turn_pts + chg_pts) * 5 / 10
 
-    # Project signals, max 20
+    # Project signals, max 15
     stypes = {s["type"] for s in p.get("socials", [])}
     project = 0
     if p.get("websites"):
@@ -479,20 +506,37 @@ def score_token(p):
         project += 2
     if p.get("has_profile"):
         project += 2
-    project = clamp(project, 0, 20)
+    if p.get("copies"):
+        project -= 4
+        flags.append(("warn", f"Copycat ({p['copies']} copies)"))
+    project = clamp(project, 0, 20) * 15 / 20
     if not p.get("websites") and not stypes:
         flags.append(("warn", "No website or socials"))
     if p.get("boosts"):
         flags.append(("info", f"Paid DexScreener boosts ({p['boosts']})"))
 
-    total = safety + liquidity + activity + momentum + project
-    if sec["fatal"]:
-        total = min(total, 5)
+    # Dev & insiders, max 25: on-chain checks of pump.fun tokens (onchain.py)
+    oc = p.get("onchain") or {}
+    caps = [5] if sec["fatal"] else []
+    if oc.get("status") == "done":
+        dev = clamp(15 + sum(f[3] for f in oc["flags"]), 0, 25)
+        flags += [(f[1], f[2]) for f in oc["flags"]]
+        ids = {f[0] for f in oc["flags"]}
+        if {"dumped", "farm"} <= ids:
+            caps.append(40)
+        if "bundled" in ids:
+            caps.append(55)
+        if (oc.get("insider_pct_now") or 0) >= 20:
+            caps.append(50)
+    else:
+        dev = 10   # EVM, not pump.fun, still checking or unavailable: neutral, like unchecked safety
+
+    total = min([safety + liquidity + activity + momentum + project + dev] + caps)
     p["flags"] = flags
     p["parts"] = {
         "safety": round(safety, 1), "liquidity": round(liquidity, 1),
         "activity": round(activity, 1), "momentum": round(momentum, 1),
-        "project": round(project, 1),
+        "project": round(project, 1), "dev": round(dev, 1),
     }
     p["score"] = int(round(clamp(total, 0, 100)))
     return p["score"]
@@ -569,6 +613,7 @@ def public_view(p):
             "socials", "image", "boosts", "score", "parts", "flags", "ds_url"]
     v = {k: p.get(k) for k in keep}
     v["checked"] = p["security"]["checked"]
+    v["onchain"] = {k: x for k, x in (p.get("onchain") or {}).items() if k != "_"} or None
     v["holders"] = p["security"].get("holders", 0)
     v["explorer"] = CHAINS.get(p["network"], (None, None, "{}"))[2].format(p["token"])
     v["gt_url"] = f"https://www.geckoterminal.com/{p['network']}/pools/{p['pool']}"
@@ -579,6 +624,7 @@ def public_view(p):
 
 # ---------------------------------------------------------------- main loop
 
+LOCK = threading.Lock()  # state shared by the scan loop and the on-chain worker
 DETAILS = ("created", "websites", "socials", "image", "boosts", "has_profile",
            "pair_count", "ds_url", "security")
 
@@ -659,47 +705,62 @@ def scan(cfg, state):
             checks[f"{p['network']}:{p['token'].lower()}"] = {
                 "at": started, "details": {k: p[k] for k in DETAILS}}
 
+    # copycats: same symbol or name as another token listed in the last 24 h
+    names = state.setdefault("names", {})
+    for p in passed:
+        names[f"{p['network']}:{p['token'].lower()}"] = [p["symbol"].lower(), p["name"].lower(), started]
+    for k in [k for k, x in names.items() if x[2] < started - 86400]:
+        del names[k]
+    for p in passed:
+        k = f"{p['network']}:{p['token'].lower()}"
+        sym, name = names[k][:2]
+        p["copies"] = sum(1 for o, x in names.items() if o != k and (x[0] == sym or (name and x[1] == name)))
+
     alerts = 0
     listed = set()
-    for p in passed:
-        sec = p["security"]
-        if sec["fatal"] and f.get("drop_honeypots", True):
-            continue
-        if sec.get("sell_tax", 0) > f["max_sell_tax"]:
-            continue
-        score_token(p)
-        key = f"{p['network']}:{p['token'].lower()}"
-        listed.add(key)
-        prev = state["tokens"].get(key)
-        v = public_view(p)
-        v["first_seen"] = prev["first_seen"] if prev else now
-        v["first_score"] = prev["first_score"] if prev else p["score"]
-        v["last_seen"] = now
-        hist = (prev or {}).get("history", [])[-23:]
-        v["history"] = hist + [p["score"]]
-        state["tokens"][key] = v
-        tg = cfg["telegram"]
-        if (tg.get("enabled") and p["score"] >= tg.get("min_score", 70)
-                and key not in state["alerted"]):
-            telegram(cfg, alert_text(p))
-            state["alerted"].append(key)
-            alerts += 1
+    with LOCK:  # the on-chain worker thread reads tokens and writes onchain/creators
+        for p in passed:
+            sec = p["security"]
+            if sec["fatal"] and f.get("drop_honeypots", True):
+                continue
+            if sec.get("sell_tax", 0) > f["max_sell_tax"]:
+                continue
+            key = f"{p['network']}:{p['token'].lower()}"
+            p["onchain"] = state["onchain"].get(key)
+            score_token(p)
+            listed.add(key)
+            prev = state["tokens"].get(key)
+            v = public_view(p)
+            v["first_seen"] = prev["first_seen"] if prev else now
+            v["first_score"] = prev["first_score"] if prev else p["score"]
+            v["last_seen"] = now
+            hist = (prev or {}).get("history", [])[-23:]
+            v["history"] = hist + [p["score"]]
+            state["tokens"][key] = v
+            tg = cfg["telegram"]
+            if (tg.get("enabled") and p["score"] >= tg.get("min_score", 70)
+                    and key not in state["alerted"]):
+                telegram(cfg, alert_text(p))
+                state["alerted"].append(key)
+                alerts += 1
 
-    # a token stays listed only while it meets the filters; if its pool could not be
-    # fetched this scan it is kept as it was, for up to 3 scan intervals
-    missing_cutoff = started - 3 * cfg["scan_interval_minutes"] * 60
-    dropped = 0
-    for key, v in list(state["tokens"].items()):
-        if key in listed:
-            continue
-        if f"{v['network']}:{v['pool']}" in seen or iso_ts(v["last_seen"]) < missing_cutoff:
-            del state["tokens"][key]
-            dropped += 1
-    if dropped:
-        log(f"{dropped} tokens no longer meet the filters and were removed")
-    for key in list(checks):
-        if key not in state["tokens"]:
-            del checks[key]
+        # a token stays listed only while it meets the filters; if its pool could not be
+        # fetched this scan it is kept as it was, for up to 3 scan intervals
+        missing_cutoff = started - 3 * cfg["scan_interval_minutes"] * 60
+        dropped = 0
+        for key, v in list(state["tokens"].items()):
+            if key in listed:
+                continue
+            if f"{v['network']}:{v['pool']}" in seen or iso_ts(v["last_seen"]) < missing_cutoff:
+                del state["tokens"][key]
+                dropped += 1
+        if dropped:
+            log(f"{dropped} tokens no longer meet the filters and were removed")
+        for cache in (checks, state["onchain"]):
+            for key in [key for key in cache if key not in state["tokens"]]:
+                del cache[key]
+        for dev in [d for d, c in state["creators"].items() if started - c["at"] > onchain.CREATOR_CACHE]:
+            del state["creators"][dev]
 
     # stop watching pools that are past the age range or never qualified in watch_minutes
     keep = {f"{v['network']}:{v['pool']}" for v in state["tokens"].values()}
@@ -727,6 +788,36 @@ def scan(cfg, state):
     return meta
 
 
+def onchain_worker(state):
+    """Background thread: on-chain dev & insider checks of listed Solana tokens, one at a
+    time. New tokens first, then re-checks when due (every 15 min under 6 h old, else hourly)."""
+    while True:
+        with LOCK:
+            now = time.time()
+            due = sorted(((state["onchain"].get(k) or {}).get("next_at", 0), k, t["token"])
+                         for k, t in state["tokens"].items() if t["network"] == "solana")
+            due = [d for d in due if d[0] <= now]
+            if due:
+                key, mint = due[0][1:]
+                prev = state["onchain"].get(key)
+                creators = dict(state["creators"])
+        if not due:
+            time.sleep(20)
+            continue
+        try:
+            result, profile = onchain.check(mint, prev, creators)
+            log(f"on-chain {mint}: {', '.join(f[2] for f in result.get('flags', [])) or result['status']} "
+                f"({time.time() - now:.0f}s)")
+        except Exception as e:  # source down, rate limited or odd data: keep the last result, retry later
+            log(f"on-chain {mint}: unavailable ({e})")
+            result, profile = dict(prev or {"status": "unavailable"}, error=str(e), next_at=time.time() + 900), None
+        with LOCK:
+            if key in state["tokens"]:
+                state["onchain"][key] = result
+            if profile:
+                state["creators"][result["creator"]] = profile
+
+
 def main():
     ap = argparse.ArgumentParser(description="Token Scout scanner")
     ap.add_argument("--config", default=os.path.join(HERE, "config.json"))
@@ -746,11 +837,16 @@ def main():
         return
 
     state = load_state(state_path)
+    state.setdefault("onchain", {})
+    state.setdefault("creators", {})
+    if not args.once:
+        threading.Thread(target=onchain_worker, args=(state,), daemon=True).start()
     while True:
         try:
             meta = scan(cfg, state)
-            save_state(state_path, state)
-            path = write_dashboard(cfg, state, meta)
+            with LOCK:
+                save_state(state_path, state)
+                path = write_dashboard(cfg, state, meta)
             log(f"dashboard updated: {path} ({meta['tracked']} tokens tracked)")
         except KeyboardInterrupt:
             raise

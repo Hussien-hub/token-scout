@@ -39,7 +39,8 @@ The page reloads itself after each scan and keeps your filters.
    GeckoTerminal's pool list for the token is checked too.
 4. **Security** – GoPlus for EVM chains, RugCheck for Solana.
    Honeypots, freeze authority and sell tax above `max_sell_tax` are dropped.
-5. **Score**
+5. **Score** (table below). Solana pump.fun tokens also get **Dev & insiders** from on-chain
+   checks that run in the background (next section).
 6. **Stay or go** – every listed token is re-checked on each scan and stays only while it still
    meets all of the above. It is removed once it fails them (liquidity pulled, activity gone,
    older than `max_age_hours`, turned into a honeypot). DexScreener and security results are
@@ -47,13 +48,51 @@ The page reloads itself after each scan and keeps your filters.
 
 | Part | Max | What counts |
 |---|---|---|
-| Safety | 35 | Starts at 35, minus penalties: unverified source, owner can change balances, mintable, proxy, hidden owner, taxes, top-holder concentration, unlocked LP, RugCheck risks. Unchecked tokens get 14. |
+| Safety | 25 | Starts full, minus penalties: unverified source, owner can change balances, mintable, proxy, hidden owner, taxes, top-holder concentration, unlocked LP, RugCheck risks. Unchecked tokens get 10. |
 | Liquidity | 15 | Depth on a log scale ($10k → 0, $500k → 12) plus a healthy liquidity/FDV ratio (8–60%). |
-| Activity | 20 | Unique buyers and txns in the last hour, buy/sell ratio between 1 and 3. Many txns from few wallets scores 0 here. |
-| Momentum | 10 | Volume turnover vs liquidity, and a 1h price move of 0–80%. Tokens already up 200%+ get nothing. |
-| Project | 20 | Website 7, X 5, Telegram 4, Discord 2, DexScreener profile 2. |
+| Activity | 15 | Unique buyers and txns in the last hour, buy/sell ratio between 1 and 3. Many txns from few wallets scores 0 here. |
+| Momentum | 5 | Volume turnover vs liquidity, and a 1h price move of 0–80%. Tokens already up 200%+ get nothing. |
+| Project | 15 | Website, X, Telegram, Discord, DexScreener profile. Copycats (same symbol or name as another token listed in the last 24 h) lose points. |
+| Dev & insiders | 25 | Solana pump.fun tokens, see below. Starts at 15. EVM tokens, other Solana tokens and tokens still being checked get a neutral 10. |
 
 Each scan rescores tracked tokens, so the dashboard shows the change since first seen and a score trend.
+
+## Dev & insiders (Solana pump.fun tokens)
+
+Many launches score well on market data and RugCheck but are wallet farms where the dev dumped in
+the first minute. `onchain.py` checks each listed Solana token on-chain, in a background thread so
+the scan stays fast: right after it is listed, then every 15 min while under 6 h old, then hourly.
+The dashboard shows `checking…` until the first result, which appears at the next scan.
+
+| Check | How | Flag | Points |
+|---|---|---|---|
+| Real creator | Signer of the pump.fun create instruction (RugCheck's `creator` is the fee recipient, which launch tools point elsewhere) | | |
+| Dev sold | The creator's token account history | `Dev dumped at launch` ≥ 80% sold within 10 min (HIGH) / `Dev sold most` ≥ 80% (MEDIUM) | −15 / −8 |
+| Dev holding | Current balance vs launch buy, after 6 h | `Dev still holding` ≥ 50% | +4 |
+| Wallet farm | Wallets the creator sent SOL to: a sample of its newest transactions scaled to all of them (cached 6 h per creator) | `Serial launcher / wallet farm` ≥ 500 (HIGH) / `Likely farm` 100–499 / < 50 | −12 / −6 / +3 |
+| Bundled launch | Create → first PumpSwap pool under 120 s **and** the dev sold most or is a farm; otherwise `Curve filled in Ns` | HIGH / MEDIUM | −8 / −3 |
+| Insiders | RugCheck insider wallets, their **current** balances read on-chain (RugCheck's are often stale) | `Insiders holding X%` ≥ 10% (HIGH) / `Insiders already exited` peak ≥ 10%, now < 3% / < 5% | −8 / 0 / +3 |
+| Round allocations | Top-20 holders with exact-million balances that arrived by plain transfer | ≥ 3 (MEDIUM) | −5 |
+| Launch tool | Metadata on `metadata.j7tracker.io` or image on `axiom-cdn` | INFO | −2 with farm signals |
+| Holders | Older than 24 h and holders still growing | | +2 |
+
+Caps on the total score: dev dumped at launch + wallet farm → 40, insiders holding ≥ 20% → 50,
+bundled launch → 55. The detail panel lists every point gained or lost, the creator, who funded it,
+and when flags appeared or cleared ("NEW" for 30 min).
+
+If the RPC or RugCheck is down the token shows `unavailable` (or keeps its last result) and is
+retried in 15 min; the scan and dashboard never wait for it.
+
+**RPC:** the public Solana RPC works but allows about one transaction lookup per second, so a first
+check takes 1–4 minutes. For more speed put a faster RPC (a free Helius key works) in `.env`,
+see `.env.example`. Never put keys in config.json or commit `.env`.
+
+Check it against known tokens (5 reference launches, prints every metric and the score):
+
+```bash
+python3 check_onchain.py              # exits 1 if a reference token gets the wrong result
+python3 check_onchain.py <mint> ...   # any pump.fun tokens
+```
 
 ## Telegram alerts
 
